@@ -271,6 +271,7 @@
         <div class="metric-chip">Memory <strong id="metric-memory">56%</strong></div>
         <div class="metric-chip">Replicas <strong id="metric-replicas">3/3</strong></div>
         <div class="metric-chip">Stability <strong id="metric-stability">--</strong></div>
+        <div class="metric-chip">Autopilot <strong id="metric-autopilot">OFF</strong></div>
       </div>
 
       <div id="messages" class="messages"></div>
@@ -281,6 +282,9 @@
         <button type="button" class="chip" data-q="heal now">Heal</button>
         <button type="button" class="chip" data-q="deployment summary">Summary</button>
         <button type="button" class="chip" data-q="analytics">Analytics</button>
+        <button type="button" class="chip" data-q="autopilot start 8 2">Autopilot Start</button>
+        <button type="button" class="chip" data-q="autopilot status">Autopilot Status</button>
+        <button type="button" class="chip" data-q="autopilot stop">Autopilot Stop</button>
         <button type="button" class="chip" data-q="help">Help</button>
         <button type="button" class="chip" id="clear-chat-btn">Clear Chat</button>
       </div>
@@ -306,10 +310,12 @@
       const metricMemory = document.getElementById("metric-memory");
       const metricReplicas = document.getElementById("metric-replicas");
       const metricStability = document.getElementById("metric-stability");
+      const metricAutopilot = document.getElementById("metric-autopilot");
       const API_BASE_STORAGE_KEY = "devops_backend_base";
       const api = {
         state: "/api/state",
         analytics: "/api/analytics",
+        autopilot: "/api/autopilot",
         history: "/api/history",
         chat: "/api/chat",
         clear: "/api/history/clear",
@@ -330,6 +336,7 @@
         memory: 56,
         replicas: "3/3",
         stability: null,
+        autopilotLabel: "OFF",
       };
 
       function timestamp() {
@@ -373,6 +380,7 @@
         metricMemory.textContent = `${state.memory}%`;
         metricReplicas.textContent = state.replicas;
         metricStability.textContent = Number.isFinite(state.stability) ? `${state.stability}/100` : "--";
+        metricAutopilot.textContent = state.autopilotLabel || "OFF";
       }
 
       function addMessage(role, text, isoTimestamp = "") {
@@ -438,6 +446,21 @@
           state.stability = Number(snapshot.stability_score.toFixed(2));
           updateSnapshot();
         }
+      }
+
+      function applyAutopilotStatus(payload) {
+        if (!payload || typeof payload !== "object") return;
+        const meta = payload.autopilot && typeof payload.autopilot === "object" ? payload.autopilot : payload;
+        if (!meta || typeof meta !== "object") return;
+
+        const running = Boolean(meta.running);
+        const cycles = typeof meta.cycles_completed === "number" ? meta.cycles_completed : null;
+        if (running) {
+          state.autopilotLabel = cycles !== null ? `ON (${cycles})` : "ON";
+        } else {
+          state.autopilotLabel = "OFF";
+        }
+        updateSnapshot();
       }
 
       function normalizeRole(role) {
@@ -507,10 +530,11 @@
 
       async function loadInitialData() {
         try {
-          const [stateResult, historyResult, analyticsResult] = await Promise.allSettled([
+          const [stateResult, historyResult, analyticsResult, autopilotResult] = await Promise.allSettled([
             fetchJson(api.state),
             fetchJson(`${api.history}?limit=150`),
             fetchJson(`${api.analytics}?window=40`),
+            fetchJson(api.autopilot),
           ]);
 
           if (stateResult.status !== "fulfilled") {
@@ -530,6 +554,9 @@
             if (analyticsPayload && analyticsPayload.analytics) {
               applyAnalyticsSnapshot(analyticsPayload.analytics);
             }
+          }
+          if (autopilotResult.status === "fulfilled") {
+            applyAutopilotStatus(autopilotResult.value);
           }
           renderHistory(historyPayload.messages || []);
         } catch (err) {
@@ -551,6 +578,15 @@
           }
         } catch (err) {
           // Ignore analytics refresh failures to keep chat responsive.
+        }
+      }
+
+      async function refreshAutopilot() {
+        try {
+          const payload = await fetchJson(api.autopilot);
+          applyAutopilotStatus(payload);
+        } catch (err) {
+          // Ignore autopilot refresh failures; older backends may not expose this route.
         }
       }
 
@@ -576,6 +612,7 @@
             addMessage("bot", payload.reply || "No response received.", payload.timestamp || "");
             if (payload.state) applyStateSnapshot(payload.state);
             refreshAnalytics();
+            refreshAutopilot();
           }, extraDelay);
         } catch (err) {
           removeTypingMessage();
@@ -607,6 +644,7 @@
             messages.innerHTML = "";
             addMessage("bot", payload.reply || "Chat history cleared.", payload.timestamp || "");
             if (payload.state) applyStateSnapshot(payload.state);
+            refreshAutopilot();
           })
           .catch((err) => {
             removeTypingMessage();
@@ -623,6 +661,7 @@
 
       updateHealthPill();
       loadInitialData();
+      window.setInterval(refreshAutopilot, 8000);
     </script>
   </body>
 </html>

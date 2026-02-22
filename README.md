@@ -63,6 +63,9 @@ Chat commands:
 - `memory`
 - `report`
 - `analytics`
+- `autopilot start 8 2`
+- `autopilot status`
+- `autopilot stop`
 - `quit`
 
 ## Python Backend (Persistent Data)
@@ -88,9 +91,12 @@ Backend saves data to:
 API routes:
 - `GET /api/state` - current deployment state snapshot
 - `GET /api/analytics?window=40` - advanced analytics summary from recent reports
+- `GET /api/autopilot` - background autonomous runner status
 - `GET /api/history?limit=150` - saved chat messages
 - `POST /api/chat` - process chatbot command and save messages
 - `POST /api/history/clear` - clear saved chat history
+- `POST /api/autopilot/start` - start background autonomous healing loop
+- `POST /api/autopilot/stop` - stop background autonomous healing loop
 - `GET /health` - health check
 - CORS enabled for local frontend/backends on different ports
 
@@ -125,6 +131,16 @@ python3 ai_devops_agent.py report
 python3 ai_devops_agent.py report --json
 python3 ai_devops_agent.py analytics
 python3 ai_devops_agent.py analytics --window 80 --json
+```
+
+Autopilot (via backend API):
+```bash
+curl -X POST "http://127.0.0.1:8000/api/autopilot/start" \
+  -H "Content-Type: application/json" \
+  -d '{"interval_seconds": 8, "max_actions": 2, "inject_event": true, "cycles": 0}'
+
+curl "http://127.0.0.1:8000/api/autopilot"
+curl -X POST "http://127.0.0.1:8000/api/autopilot/stop"
 ```
 
 Benchmark:

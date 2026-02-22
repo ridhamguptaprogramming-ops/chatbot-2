@@ -44,6 +44,22 @@ class BackendService:
         self.chat_data = self.chat_store.load()
         self._normalize_chat_data()
 
+        self._autopilot_stop = threading.Event()
+        self._autopilot_thread: Optional[threading.Thread] = None
+        self._autopilot = {
+            "running": False,
+            "started_at": "",
+            "stopped_at": "",
+            "interval_seconds": 8.0,
+            "max_actions": 2,
+            "inject_event": True,
+            "target_cycles": 0,
+            "cycles_completed": 0,
+            "last_cycle_at": "",
+            "last_summary": "",
+            "last_error": "",
+        }
+
     def _normalize_chat_data(self) -> None:
         messages = self.chat_data.get("messages")
         if not isinstance(messages, list):
@@ -75,6 +91,10 @@ class BackendService:
     def _save_chat(self) -> None:
         self.chat_store.save(self.chat_data)
 
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
     def _state_snapshot_locked(self) -> Dict[str, Any]:
         state = self.platform.get_state(self.service)
         severity = self.agent.classify_severity(state)
@@ -97,6 +117,17 @@ class BackendService:
     def get_state_snapshot(self) -> Dict[str, Any]:
         with self.lock:
             return self._state_snapshot_locked()
+
+    def get_autopilot_status(self) -> Dict[str, Any]:
+        with self.lock:
+            running = bool(
+                self._autopilot.get("running")
+                and self._autopilot_thread is not None
+                and self._autopilot_thread.is_alive()
+            )
+            if not running:
+                self._autopilot["running"] = False
+            return {"autopilot": dict(self._autopilot)}
 
     def get_analytics(self, window: int = 40) -> Dict[str, Any]:
         with self.lock:
@@ -121,6 +152,150 @@ class BackendService:
         self._save_chat()
         return message
 
+    @staticmethod
+    def _clamp_float(value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+        return max(minimum, min(maximum, value))
+
+    def _autopilot_loop(self) -> None:
+        while not self._autopilot_stop.is_set():
+            with self.lock:
+                interval_seconds = float(self._autopilot.get("interval_seconds", 8.0))
+                max_actions = int(self._autopilot.get("max_actions", 2))
+                inject_event = bool(self._autopilot.get("inject_event", True))
+                target_cycles = int(self._autopilot.get("target_cycles", 0))
+                completed = int(self._autopilot.get("cycles_completed", 0))
+                if target_cycles > 0 and completed >= target_cycles:
+                    self._autopilot["running"] = False
+                    self._autopilot["stopped_at"] = self._utc_now()
+                    break
+
+                cycle_number = completed + 1
+                try:
+                    report = self.agent.run_healing_cycle(
+                        self.service,
+                        inject_event=inject_event,
+                        max_actions=max_actions,
+                        dry_run=False,
+                    )
+                    summary = summarize_report(report)
+                    self._autopilot["cycles_completed"] = cycle_number
+                    self._autopilot["last_cycle_at"] = self._utc_now()
+                    self._autopilot["last_summary"] = summary
+                    self._autopilot["last_error"] = ""
+                    self._append_message("assistant", f"[autopilot] cycle {cycle_number}: {summary}", kind="autopilot")
+                except Exception as err:
+                    self._autopilot["last_error"] = str(err)
+                    self._autopilot["running"] = False
+                    self._autopilot["stopped_at"] = self._utc_now()
+                    self._append_message("assistant", f"[autopilot] error: {err}", kind="autopilot")
+                    break
+
+                if target_cycles > 0 and cycle_number >= target_cycles:
+                    self._autopilot["running"] = False
+                    self._autopilot["stopped_at"] = self._utc_now()
+                    self._append_message(
+                        "assistant",
+                        f"[autopilot] completed {target_cycles} cycle(s) and stopped.",
+                        kind="autopilot",
+                    )
+                    break
+
+            if self._autopilot_stop.wait(interval_seconds):
+                break
+
+        with self.lock:
+            if self._autopilot.get("running"):
+                self._autopilot["running"] = False
+                self._autopilot["stopped_at"] = self._utc_now()
+
+    def start_autopilot(
+        self,
+        interval_seconds: float = 8.0,
+        max_actions: int = 2,
+        inject_event: bool = True,
+        cycles: int = 0,
+    ) -> Dict[str, Any]:
+        with self.lock:
+            currently_running = bool(
+                self._autopilot.get("running")
+                and self._autopilot_thread is not None
+                and self._autopilot_thread.is_alive()
+            )
+            if currently_running:
+                return {"started": False, "reason": "already_running", "autopilot": dict(self._autopilot)}
+
+            safe_interval = self._clamp_float(float(interval_seconds), 1.0, 300.0)
+            safe_actions = self._clamp_int(int(max_actions), 1, 5)
+            safe_cycles = self._clamp_int(int(cycles), 0, 2000)
+
+            self._autopilot_stop.clear()
+            self._autopilot.update(
+                {
+                    "running": True,
+                    "started_at": self._utc_now(),
+                    "stopped_at": "",
+                    "interval_seconds": round(safe_interval, 2),
+                    "max_actions": safe_actions,
+                    "inject_event": bool(inject_event),
+                    "target_cycles": safe_cycles,
+                    "cycles_completed": 0,
+                    "last_cycle_at": "",
+                    "last_summary": "",
+                    "last_error": "",
+                }
+            )
+            self._append_message(
+                "assistant",
+                (
+                    f"[autopilot] started: interval={safe_interval:.2f}s, max_actions={safe_actions}, "
+                    f"inject_event={bool(inject_event)}, target_cycles={safe_cycles or 'unbounded'}"
+                ),
+                kind="autopilot",
+            )
+
+            self._autopilot_thread = threading.Thread(target=self._autopilot_loop, name="autopilot-loop", daemon=True)
+            self._autopilot_thread.start()
+            return {"started": True, "autopilot": dict(self._autopilot)}
+
+    def stop_autopilot(self, wait_seconds: float = 2.0) -> Dict[str, Any]:
+        lock_owned_by_current = bool(getattr(self.lock, "_is_owned", lambda: False)())
+        thread: Optional[threading.Thread]
+        with self.lock:
+            running = bool(
+                self._autopilot.get("running")
+                and self._autopilot_thread is not None
+                and self._autopilot_thread.is_alive()
+            )
+            if not running:
+                self._autopilot["running"] = False
+                return {"stopped": False, "reason": "not_running", "autopilot": dict(self._autopilot)}
+            thread = self._autopilot_thread
+            self._autopilot_stop.set()
+
+        # If caller already holds self.lock (e.g. process_message), joining here can starve worker shutdown.
+        if lock_owned_by_current:
+            return {"stopped": False, "reason": "stop_requested", "autopilot": dict(self._autopilot)}
+
+        if thread is not None:
+            thread.join(timeout=max(0.1, float(wait_seconds)))
+
+        with self.lock:
+            still_running = bool(thread is not None and thread.is_alive())
+            self._autopilot["running"] = still_running
+            if not still_running:
+                self._autopilot["stopped_at"] = self._utc_now()
+                self._append_message("assistant", "[autopilot] stopped by user.", kind="autopilot")
+                self._autopilot_thread = None
+                return {"stopped": True, "autopilot": dict(self._autopilot)}
+            return {"stopped": False, "reason": "stop_timeout", "autopilot": dict(self._autopilot)}
+
+    def shutdown(self) -> None:
+        self.stop_autopilot(wait_seconds=2.0)
+
     def get_history(self, limit: int) -> List[Dict[str, Any]]:
         with self.lock:
             safe_limit = max(1, min(500, int(limit)))
@@ -135,7 +310,7 @@ class BackendService:
             self.chat_data["next_id"] = 1
             reply_message = self._append_message(
                 "assistant",
-                "Chat history cleared. Ask for status, summary, diagnose, heal, report, or analytics.",
+                "Chat history cleared. Ask for status, summary, diagnose, heal, report, analytics, or autopilot.",
                 kind="system",
             )
             snapshot = self._state_snapshot_locked()
@@ -155,6 +330,21 @@ class BackendService:
         cycles = int(raw_cycles) if raw_cycles else 3
         max_actions = int(raw_actions) if raw_actions else 2
         return (max(1, min(20, cycles)), max(1, min(5, max_actions)))
+
+    @staticmethod
+    def _parse_autopilot_start(message: str) -> tuple[float, int, int]:
+        match = re.match(
+            r"^\s*autopilot\s+start(?:\s+(\d+(?:\.\d+)?))?(?:\s+(\d+))?(?:\s+(\d+))?\s*$",
+            message,
+            re.IGNORECASE,
+        )
+        if not match:
+            return (8.0, 2, 0)
+        raw_interval, raw_actions, raw_cycles = match.groups()
+        interval = float(raw_interval) if raw_interval else 8.0
+        max_actions = int(raw_actions) if raw_actions else 2
+        cycles = int(raw_cycles) if raw_cycles else 0
+        return (interval, max_actions, cycles)
 
     def _summary_text_locked(self) -> str:
         snapshot = self._state_snapshot_locked()
@@ -180,7 +370,7 @@ class BackendService:
             if lowered in {"", " "}:
                 reply = (
                     "Please type a command. Try: status, summary, diagnose, heal, simulate, auto 5, report, "
-                    "memory, analytics."
+                    "memory, analytics, autopilot status."
                 )
                 assistant_message = self._append_message("assistant", reply, kind="system")
                 return {
@@ -198,31 +388,48 @@ class BackendService:
             if "help" in lowered:
                 reply = (
                     "Commands: status, summary, diagnose, heal, simulate, auto <cycles> <max_actions>, "
+                    "autopilot start <interval_s> <max_actions> <cycles>, autopilot status, autopilot stop, "
                     "report, memory, analytics <window>, clear."
                 )
-            elif "status" in lowered:
-                reply = self._state_snapshot_locked()["formatted"]
-            elif "summary" in lowered:
-                reply = self._summary_text_locked()
-            elif "simulate" in lowered:
-                event = self.platform.inject_random_event(self.service)
-                reply = f"Incident simulated: {event}\n{self._state_snapshot_locked()['formatted']}"
-            elif "diagnose" in lowered:
-                report = self.agent.run_healing_cycle(
-                    self.service,
-                    inject_event=False,
-                    max_actions=safe_max_actions,
-                    dry_run=True,
+            elif re.match(r"^\s*autopilot\s+start(?:\s+\d+(?:\.\d+)?)?(?:\s+\d+)?(?:\s+\d+)?\s*$", lowered):
+                interval, parsed_actions, cycles = self._parse_autopilot_start(user_text)
+                result = self.start_autopilot(
+                    interval_seconds=interval,
+                    max_actions=parsed_actions,
+                    inject_event=True,
+                    cycles=cycles,
                 )
-                reply = format_detailed_report(report)
-            elif "heal" in lowered or "fix" in lowered:
-                report = self.agent.run_healing_cycle(
-                    self.service,
-                    inject_event=False,
-                    max_actions=safe_max_actions,
-                    dry_run=False,
+                if result.get("started"):
+                    meta = result["autopilot"]
+                    reply = (
+                        "Autopilot started.\n"
+                        f"interval={meta['interval_seconds']}s, max_actions={meta['max_actions']}, "
+                        f"target_cycles={meta['target_cycles'] or 'unbounded'}"
+                    )
+                else:
+                    reply = "Autopilot is already running."
+            elif re.match(r"^\s*autopilot\s+stop\s*$", lowered):
+                result = self.stop_autopilot(wait_seconds=2.0)
+                if result.get("stopped"):
+                    reply = "Autopilot stopped."
+                elif result.get("reason") == "stop_requested":
+                    reply = "Autopilot stop requested. It will stop shortly."
+                elif result.get("reason") == "not_running":
+                    reply = "Autopilot is not running."
+                else:
+                    reply = "Autopilot stop requested, but worker is still shutting down."
+            elif re.match(r"^\s*autopilot(?:\s+status)?\s*$", lowered):
+                meta = self.get_autopilot_status()["autopilot"]
+                reply = (
+                    "Autopilot Status\n"
+                    f"running={meta['running']}\n"
+                    f"interval={meta['interval_seconds']}s\n"
+                    f"max_actions={meta['max_actions']}\n"
+                    f"target_cycles={meta['target_cycles'] or 'unbounded'}\n"
+                    f"cycles_completed={meta['cycles_completed']}\n"
+                    f"last_cycle_at={meta['last_cycle_at'] or '-'}\n"
+                    f"last_error={meta['last_error'] or '-'}"
                 )
-                reply = summarize_report(report)
             elif re.match(r"^\s*auto(?:\s+\d+)?(?:\s+\d+)?\s*$", lowered):
                 cycles, parsed_actions = self._parse_auto_command(user_text)
                 summaries: List[str] = []
@@ -235,6 +442,29 @@ class BackendService:
                     )
                     summaries.append(f"{index}. {summarize_report(report)}")
                 reply = "Autonomous run complete.\n" + "\n".join(summaries)
+            elif re.match(r"^\s*status\s*$", lowered):
+                reply = self._state_snapshot_locked()["formatted"]
+            elif re.match(r"^\s*summary\s*$", lowered):
+                reply = self._summary_text_locked()
+            elif re.match(r"^\s*simulate(?:\s+incident)?\s*$", lowered):
+                event = self.platform.inject_random_event(self.service)
+                reply = f"Incident simulated: {event}\n{self._state_snapshot_locked()['formatted']}"
+            elif re.match(r"^\s*diagnose\s*$", lowered):
+                report = self.agent.run_healing_cycle(
+                    self.service,
+                    inject_event=False,
+                    max_actions=safe_max_actions,
+                    dry_run=True,
+                )
+                reply = format_detailed_report(report)
+            elif re.match(r"^\s*(heal|fix)(?:\s+now)?\s*$", lowered):
+                report = self.agent.run_healing_cycle(
+                    self.service,
+                    inject_event=False,
+                    max_actions=safe_max_actions,
+                    dry_run=False,
+                )
+                reply = summarize_report(report)
             elif "report" in lowered:
                 latest = self.agent.memory.latest_report()
                 if latest is None:
@@ -258,8 +488,8 @@ class BackendService:
                 reply = f"Current latency is {snapshot['latency_ms']}ms."
             else:
                 reply = (
-                    "I can help with status, summary, diagnose, heal, simulate incidents, auto runs, report, "
-                    "memory, and analytics."
+                    "I can help with status, summary, diagnose, heal, simulate incidents, auto runs, autopilot, "
+                    "report, memory, and analytics."
                 )
 
             assistant_message = self._append_message("assistant", reply, kind="assistant")
@@ -349,6 +579,10 @@ class AppRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"state": backend.get_state_snapshot()})
             return
 
+        if path == "/api/autopilot":
+            self._send_json(HTTPStatus.OK, backend.get_autopilot_status())
+            return
+
         if path == "/api/analytics":
             query = parse_qs(parsed.query)
             raw_window = query.get("window", ["40"])[0]
@@ -397,6 +631,26 @@ class AppRequestHandler(BaseHTTPRequestHandler):
 
             if path == "/api/history/clear":
                 response = backend.clear_history()
+                self._send_json(HTTPStatus.OK, response)
+                return
+
+            if path == "/api/autopilot/start":
+                payload = self._read_json_body()
+                interval_seconds = float(payload.get("interval_seconds", 8.0))
+                max_actions = int(payload.get("max_actions", 2))
+                inject_event = bool(payload.get("inject_event", True))
+                cycles = int(payload.get("cycles", 0))
+                response = backend.start_autopilot(
+                    interval_seconds=interval_seconds,
+                    max_actions=max_actions,
+                    inject_event=inject_event,
+                    cycles=cycles,
+                )
+                self._send_json(HTTPStatus.OK, response)
+                return
+
+            if path == "/api/autopilot/stop":
+                response = backend.stop_autopilot(wait_seconds=2.0)
                 self._send_json(HTTPStatus.OK, response)
                 return
         except ValueError as err:
@@ -453,8 +707,8 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, int(args.port)), AppRequestHandler)
     print(f"Backend running on http://{args.host}:{args.port}")
     print(
-        "Routes: GET /, GET /api/state, GET /api/analytics, GET /api/history, "
-        "POST /api/chat, POST /api/history/clear"
+        "Routes: GET /, GET /api/state, GET /api/analytics, GET /api/autopilot, GET /api/history, "
+        "POST /api/chat, POST /api/history/clear, POST /api/autopilot/start, POST /api/autopilot/stop"
     )
 
     try:
@@ -462,6 +716,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        backend.shutdown()
         server.server_close()
         print("Backend server stopped.")
 
