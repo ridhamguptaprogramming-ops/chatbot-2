@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -48,11 +50,28 @@ class JsonFileStore:
             return json.loads(json.dumps(self.default_data))
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError):
             return json.loads(json.dumps(self.default_data))
 
     def save(self, payload: Dict[str, object]) -> None:
-        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(payload, indent=2)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self.path.parent),
+                delete=False,
+            ) as temp_file:
+                temp_file.write(data)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_path = temp_file.name
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
 
 class MockDeploymentPlatform:
@@ -77,15 +96,54 @@ class MockDeploymentPlatform:
     def _save(self) -> None:
         self.state_store.save(self.state_data)
 
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
+
+    def _sanitize_record(self, rec: Dict[str, object]) -> None:
+        rec["error_rate"] = self._clamp(float(rec.get("error_rate", 0.5)), 0.0, 100.0) # type: ignore
+        rec["latency_ms"] = int(self._clamp(float(rec.get("latency_ms", 140)), 50.0, 5000.0)) # type: ignore
+        rec["cpu_percent"] = self._clamp(float(rec.get("cpu_percent", 48.0)), 0.0, 100.0) # type: ignore
+        rec["memory_percent"] = self._clamp(float(rec.get("memory_percent", 58.0)), 0.0, 100.0) # type: ignore
+        rec["desired_replicas"] = int(self._clamp(float(rec.get("desired_replicas", 3)), 1.0, 10.0)) # type: ignore
+        rec["ready_replicas"] = int(
+            self._clamp(float(rec.get("ready_replicas", rec["desired_replicas"])), 0.0, float(rec["desired_replicas"])) # type: ignore
+        )
+        rec["consecutive_failures"] = int(self._clamp(float(rec.get("consecutive_failures", 0)), 0.0, 50.0)) # type: ignore
+
+        status = str(rec.get("status", "healthy"))
+        if status not in {"healthy", "degraded", "failed"}:
+            status = "healthy"
+
+        if rec["ready_replicas"] == 0:
+            status = "failed"
+        elif (
+            rec["error_rate"] >= 1.5
+            or rec["latency_ms"] >= 450
+            or rec["cpu_percent"] >= 85.0
+            or rec["memory_percent"] >= 90.0
+            or rec["ready_replicas"] < rec["desired_replicas"]
+            or rec["consecutive_failures"] > 0
+        ):
+            status = "degraded"
+        else:
+            status = "healthy"
+        rec["status"] = status
+
     def ensure_service(self, service: str) -> None:
         services = self.state_data.setdefault("services", {})
-        if service not in services:
-            services[service] = self._default_service_state(service)
+        created = service not in services # type: ignore
+        if created:
+            services[service] = self._default_service_state(service) # type: ignore
+        before = json.dumps(services[service], sort_keys=True) # type: ignore
+        self._sanitize_record(services[service]) # type: ignore
+        after = json.dumps(services[service], sort_keys=True) # type: ignore
+        if created or before != after:
             self._save()
 
     def get_state(self, service: str) -> DeploymentState:
         self.ensure_service(service)
-        record = self.state_data["services"][service]
+        record = self.state_data["services"][service] # type: ignore
         return DeploymentState(
             service=record["service"],
             version=record["version"],
@@ -101,12 +159,13 @@ class MockDeploymentPlatform:
 
     def _mutate_state(self, service: str, mutate_fn) -> None:
         self.ensure_service(service)
-        mutate_fn(self.state_data["services"][service])
+        mutate_fn(self.state_data["services"][service]) # type: ignore
+        self._sanitize_record(self.state_data["services"][service]) # type: ignore
         self._save()
 
     def inject_random_event(self, service: str) -> str:
         self.ensure_service(service)
-        state = self.state_data["services"][service]
+        state = self.state_data["services"][service] # type: ignore
         roll = random.random()
 
         if roll < 0.20:
@@ -138,17 +197,18 @@ class MockDeploymentPlatform:
                 state["consecutive_failures"] = max(0, int(state["consecutive_failures"]) - 1)
             event = "System stabilized naturally."
 
+        self._sanitize_record(state)
         self._save()
         return event
 
     def restart_service(self, service: str) -> ActionResult:
         def mutate(rec: Dict[str, object]) -> None:
-            rec["error_rate"] = max(0.2, float(rec["error_rate"]) * 0.55)
-            rec["latency_ms"] = max(120, int(int(rec["latency_ms"]) * 0.8))
-            rec["memory_percent"] = max(45.0, float(rec["memory_percent"]) * 0.75)
-            rec["ready_replicas"] = max(int(rec["ready_replicas"]), int(rec["desired_replicas"]) - 1)
+            rec["error_rate"] = max(0.2, float(rec["error_rate"]) * 0.55) # type: ignore
+            rec["latency_ms"] = max(120, int(int(rec["latency_ms"]) * 0.8)) # type: ignore
+            rec["memory_percent"] = max(45.0, float(rec["memory_percent"]) * 0.75) # type: ignore
+            rec["ready_replicas"] = max(int(rec["ready_replicas"]), int(rec["desired_replicas"]) - 1) # type: ignore
             rec["status"] = "degraded" if float(rec["error_rate"]) > 1.5 else "healthy"
-            rec["consecutive_failures"] = max(0, int(rec["consecutive_failures"]) - 1)
+            rec["consecutive_failures"] = max(0, int(rec["consecutive_failures"]) - 1) # type: ignore
 
         self._mutate_state(service, mutate)
         return ActionResult(action="restart_service", ok=True, details=f"{service} restarted.")
@@ -156,11 +216,11 @@ class MockDeploymentPlatform:
     def rollback(self, service: str, target_version: str) -> ActionResult:
         def mutate(rec: Dict[str, object]) -> None:
             rec["version"] = target_version
-            rec["error_rate"] = max(0.2, float(rec["error_rate"]) * 0.35)
-            rec["latency_ms"] = max(110, int(int(rec["latency_ms"]) * 0.7))
-            rec["cpu_percent"] = max(35.0, float(rec["cpu_percent"]) * 0.82)
-            rec["memory_percent"] = max(45.0, float(rec["memory_percent"]) * 0.88)
-            rec["ready_replicas"] = int(rec["desired_replicas"])
+            rec["error_rate"] = max(0.2, float(rec["error_rate"]) * 0.35) # type: ignore
+            rec["latency_ms"] = max(110, int(int(rec["latency_ms"]) * 0.7)) # type: ignore
+            rec["cpu_percent"] = max(35.0, float(rec["cpu_percent"]) * 0.82) # type: ignore
+            rec["memory_percent"] = max(45.0, float(rec["memory_percent"]) * 0.88) # type: ignore
+            rec["ready_replicas"] = int(rec["desired_replicas"]) # type: ignore
             rec["status"] = "healthy"
             rec["consecutive_failures"] = 0
 
@@ -171,18 +231,18 @@ class MockDeploymentPlatform:
         def mutate(rec: Dict[str, object]) -> None:
             capped = min(10, max(1, replicas))
             rec["desired_replicas"] = capped
-            rec["ready_replicas"] = min(capped, int(rec["ready_replicas"]) + 1)
-            rec["cpu_percent"] = max(32.0, float(rec["cpu_percent"]) * 0.86)
-            rec["latency_ms"] = max(120, int(int(rec["latency_ms"]) * 0.82))
-            rec["status"] = "degraded" if float(rec["error_rate"]) > 2.0 else "healthy"
+            rec["ready_replicas"] = min(capped, int(rec["ready_replicas"]) + 1) # type: ignore
+            rec["cpu_percent"] = max(32.0, float(rec["cpu_percent"]) * 0.86) # type: ignore
+            rec["latency_ms"] = max(120, int(int(rec["latency_ms"]) * 0.82)) # type: ignore
+            rec["status"] = "degraded" if float(rec["error_rate"]) > 2.0 else "healthy" # type: ignore
 
         self._mutate_state(service, mutate)
         return ActionResult(action="scale", ok=True, details=f"{service} scaled to {replicas} replicas.")
 
     def clear_cache(self, service: str) -> ActionResult:
         def mutate(rec: Dict[str, object]) -> None:
-            rec["latency_ms"] = max(120, int(int(rec["latency_ms"]) * 0.86))
-            rec["error_rate"] = max(0.2, float(rec["error_rate"]) * 0.78)
+            rec["latency_ms"] = max(120, int(int(rec["latency_ms"]) * 0.86)) # type: ignore
+            rec["error_rate"] = max(0.2, float(rec["error_rate"]) * 0.78) # type: ignore
             rec["status"] = "degraded" if float(rec["error_rate"]) > 1.8 else "healthy"
 
         self._mutate_state(service, mutate)
@@ -199,7 +259,7 @@ class AgentMemory:
 
     def stats_for(self, action_name: str) -> Dict[str, int]:
         stats = self.data.setdefault("action_stats", {})
-        return stats.setdefault(action_name, {"ok": 0, "failed": 0})
+        return stats.setdefault(action_name, {"ok": 0, "failed": 0}) # type: ignore
 
     def record(self, action_name: str, ok: bool, report: Dict[str, object]) -> None:
         stats = self.stats_for(action_name)
@@ -208,7 +268,7 @@ class AgentMemory:
         else:
             stats["failed"] += 1
 
-        reports: List[Dict[str, object]] = self.data.setdefault("recent_reports", [])
+        reports: List[Dict[str, object]] = self.data.setdefault("recent_reports", []) # type: ignore
         reports.append(report)
         if len(reports) > 30:
             del reports[0 : len(reports) - 30]
@@ -219,13 +279,19 @@ class AgentMemory:
         if not stats:
             return "No historical actions recorded yet."
         parts = []
-        for action, values in sorted(stats.items()):
+        for action, values in sorted(stats.items()): # type: ignore
             ok = values.get("ok", 0)
             failed = values.get("failed", 0)
             total = ok + failed
             rate = (ok / total * 100.0) if total else 0.0
             parts.append(f"{action}: ok={ok}, failed={failed}, success={rate:.1f}%")
         return " | ".join(parts)
+
+    def latest_report(self) -> Optional[Dict[str, Any]]:
+        reports = self.data.get("recent_reports", [])
+        if not reports:
+            return None
+        return reports[-1] # type: ignore
 
 
 class SelfHealingDevOpsAgent:
@@ -298,6 +364,9 @@ class SelfHealingDevOpsAgent:
         if state.status == "degraded" and state.latency_ms > 450:
             actions.append(Action("clear_cache", "Latency regression in degraded mode.", {}))
 
+        if state.status == "degraded" and not actions:
+            actions.append(Action("restart_service", "Fallback remediation for degraded state.", {}))
+
         if not actions:
             return [Action("observe_only", "System is healthy, no remediation needed.", {})]
 
@@ -333,7 +402,7 @@ class SelfHealingDevOpsAgent:
         if action.name == "restart_service":
             return self.platform.restart_service(service)
         if action.name == "scale":
-            replicas = int(action.params.get("replicas", 3))
+            replicas = int(action.params.get("replicas", 3)) # type: ignore
             return self.platform.scale(service, replicas)
         if action.name == "clear_cache":
             return self.platform.clear_cache(service)
@@ -410,7 +479,7 @@ class DevOpsChatbot:
 
     def run(self) -> None:
         print("AI DevOps Agent Chatbot (Python only)")
-        print("Type: status, heal, simulate, auto 5, memory, help, quit")
+        print("Type: status, heal, simulate, auto 5, memory, report, help, quit")
 
         while True:
             try:
@@ -426,7 +495,7 @@ class DevOpsChatbot:
                 print("bot> Session closed.")
                 return
             if lowered == "help":
-                print("bot> Commands: status | heal | simulate | auto <cycles> | memory | quit")
+                print("bot> Commands: status | heal | simulate | auto <cycles> | memory | report | quit")
                 continue
             if lowered == "status":
                 print(f"bot> {format_state(self.platform.get_state(self.service))}")
@@ -454,6 +523,13 @@ class DevOpsChatbot:
             if lowered == "memory":
                 print(f"bot> {self.agent.memory.summary()}")
                 continue
+            if lowered == "report":
+                latest = self.agent.memory.latest_report()
+                if latest is None:
+                    print("bot> No report available yet. Run heal or auto first.")
+                else:
+                    print(f"bot> {format_detailed_report(latest)}")
+                continue
 
             if any(word in lowered for word in ["deploy", "broken", "fix", "incident", "down"]):
                 report = self.agent.run_healing_cycle(self.service, inject_event=True)
@@ -473,13 +549,29 @@ def format_state(state: DeploymentState) -> str:
 
 
 def summarize_report(report: Dict[str, object]) -> str:
-    action = report["chosen_action"]["name"]
-    reason = report["chosen_action"]["reason"]
+    action = report["chosen_action"]["name"] # type: ignore
+    reason = report["chosen_action"]["reason"] # type: ignore
     improved = report["improved"]
-    after_state = DeploymentState(**report["after"])
+    after_state = DeploymentState(**report["after"]) # type: ignore
     return (
         f"Action={action}; reason={reason}; improved={improved}; "
         f"now {format_state(after_state)}"
+    )
+
+
+def format_detailed_report(report: Dict[str, Any]) -> str:
+    before_state = DeploymentState(**report["before"])
+    after_state = DeploymentState(**report["after"])
+    action = report["chosen_action"]["name"]
+    reason = report["chosen_action"]["reason"]
+    improved = report["improved"]
+    findings = "; ".join(report.get("findings", []))
+    return (
+        f"timestamp={report['timestamp']} | action={action} | improved={improved}\n"
+        f"reason={reason}\n"
+        f"findings={findings}\n"
+        f"before={format_state(before_state)}\n"
+        f"after={format_state(after_state)}"
     )
 
 
@@ -540,6 +632,8 @@ def parse_args() -> argparse.Namespace:
     loop_parser.add_argument("--simulate", action="store_true", help="Inject random events each cycle.")
 
     subparsers.add_parser("memory", help="Show memory statistics from past actions.")
+    report_parser = subparsers.add_parser("report", help="Show the latest healing report.")
+    report_parser.add_argument("--json", action="store_true", help="Print full report as JSON.")
     return parser.parse_args()
 
 
@@ -574,6 +668,17 @@ def main() -> None:
 
     if command == "memory":
         print(agent.memory.summary())
+        return
+
+    if command == "report":
+        latest = agent.memory.latest_report()
+        if latest is None:
+            print("No report available yet. Run heal or loop first.")
+            return
+        if args.json:
+            print(json.dumps(latest, indent=2))
+        else:
+            print(format_detailed_report(latest))
         return
 
     chatbot = DevOpsChatbot(agent, platform, args.service)

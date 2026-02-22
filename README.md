@@ -59,6 +59,7 @@ The agent persists action outcomes and reuses them for better future action sele
 - `heal`
 - `auto 5`
 - `memory`
+- `report`
 - `help`
 - `quit`
 
@@ -74,6 +75,7 @@ Then type:
 - `heal`
 - `auto 5`
 - `memory`
+- `report`
 
 ## 5) Non-Interactive Commands
 
@@ -95,6 +97,16 @@ python3 ai_devops_agent.py loop --cycles 10 --interval 2 --simulate
 Show learned memory:
 ```bash
 python3 ai_devops_agent.py memory
+```
+
+Show latest healing report:
+```bash
+python3 ai_devops_agent.py report
+```
+
+Show latest healing report as JSON:
+```bash
+python3 ai_devops_agent.py report --json
 ```
 
 ## 6) Why This Is Autonomous
