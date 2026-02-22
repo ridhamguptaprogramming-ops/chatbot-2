@@ -495,31 +495,21 @@ class AgentMemory:
 
 
 class SelfHealingDevOpsAgent:
-    BASE_PRIORITY = {
-        "rollback": 95.0,
-        "restart_service": 80.0,
-        "scale": 70.0,
-        "clear_cache": 55.0,
-        "observe_only": 10.0,
-    }
-    ACTION_COOLDOWN_SECONDS = {
-        "rollback": 180,
-        "restart_service": 45,
-        "scale": 20,
-        "clear_cache": 20,
-        "observe_only": 0,
-    }
-    ACTION_RATE_LIMIT_PER_5M = {
-        "rollback": 1,
-        "restart_service": 5,
-        "scale": 8,
-        "clear_cache": 8,
-        "observe_only": 999,
-    }
-
-    def __init__(self, platform: MockDeploymentPlatform, memory: AgentMemory):
+    def __init__(
+        self,
+        platform: MockDeploymentPlatform,
+        memory: AgentMemory,
+        config: Optional[AgentConfig] = None,
+    ):
         self.platform = platform
         self.memory = memory
+        self.config = config or AgentConfig.default()
+        self.base_priority = dict(self.config.base_priority)
+        self.action_cooldown_seconds = dict(self.config.cooldown_seconds)
+        self.action_rate_limit_per_5m = dict(self.config.rate_limit_per_5m)
+        self.severity_thresholds = dict(self.config.severity_thresholds)
+        self.action_penalty = dict(self.config.action_penalty)
+        self.exploration_strength = float(self.config.exploration_strength)
 
     def diagnose(self, state: DeploymentState) -> List[str]:
         findings: List[str] = []
@@ -543,11 +533,14 @@ class SelfHealingDevOpsAgent:
 
     def classify_severity(self, state: DeploymentState) -> str:
         risk = self._risk_score(state)
-        if state.status == "failed" or risk >= 130:
+        critical_threshold = float(self.severity_thresholds.get("critical", 130.0))
+        high_threshold = float(self.severity_thresholds.get("high", 85.0))
+        medium_threshold = float(self.severity_thresholds.get("medium", 45.0))
+        if state.status == "failed" or risk >= critical_threshold:
             return "critical"
-        if risk >= 85:
+        if risk >= high_threshold:
             return "high"
-        if risk >= 45:
+        if risk >= medium_threshold:
             return "medium"
         return "low"
 
@@ -607,14 +600,14 @@ class SelfHealingDevOpsAgent:
         if action_name == "observe_only":
             return ""
 
-        cooldown = self.ACTION_COOLDOWN_SECONDS.get(action_name, 0)
+        cooldown = self.action_cooldown_seconds.get(action_name, 0)
         if cooldown > 0:
             since_last = self.memory.seconds_since_last_action(service, action_name)
             if since_last is not None and since_last < cooldown:
                 wait_for = int(cooldown - since_last)
                 return f"cooldown_active_wait_{wait_for}s"
 
-        max_in_window = self.ACTION_RATE_LIMIT_PER_5M.get(action_name, 999)
+        max_in_window = self.action_rate_limit_per_5m.get(action_name, 999)
         recent_count = self.memory.recent_action_count(service, action_name, within_seconds=300)
         if recent_count >= max_in_window:
             return f"rate_limited_5m_{recent_count}/{max_in_window}"
@@ -650,13 +643,16 @@ class SelfHealingDevOpsAgent:
         return Action("observe_only", "All remediation actions blocked by safety policy.", {})
 
     def _action_score(self, action: Action) -> float:
-        base = self.BASE_PRIORITY.get(action.name, 25.0)
+        base = self.base_priority.get(action.name, 25.0)
         stats = self.memory.stats_for(action.name)
         ok = stats.get("ok", 0)
         failed = stats.get("failed", 0)
-        total = ok + failed
-        success_rate = (ok / total) if total else 0.55
-        return base + success_rate * 20.0 - failed * 0.35
+        attempts = ok + failed
+        success_rate = (ok / attempts) if attempts else 0.55
+        global_attempts = max(1, self.memory.global_action_total())
+        exploration_bonus = self.exploration_strength * math.sqrt(math.log(global_attempts + 1) / (attempts + 1))
+        penalty = float(self.action_penalty.get(action.name, 0.0))
+        return base + success_rate * 20.0 + exploration_bonus - failed * 0.35 - penalty
 
     def execute(self, service: str, action: Action) -> ActionResult:
         if action.name == "rollback":
@@ -970,7 +966,11 @@ def format_detailed_report(report: Dict[str, Any]) -> str:
     )
 
 
-def build_agent(state_path: Path, memory_path: Path) -> tuple[SelfHealingDevOpsAgent, MockDeploymentPlatform]:
+def build_agent(
+    state_path: Path,
+    memory_path: Path,
+    config: Optional[AgentConfig] = None,
+) -> tuple[SelfHealingDevOpsAgent, MockDeploymentPlatform]:
     state_store = JsonFileStore(
         state_path,
         default_data={
@@ -987,7 +987,7 @@ def build_agent(state_path: Path, memory_path: Path) -> tuple[SelfHealingDevOpsA
     )
     platform = MockDeploymentPlatform(state_store)
     memory = AgentMemory(memory_store)
-    return SelfHealingDevOpsAgent(platform, memory), platform
+    return SelfHealingDevOpsAgent(platform, memory, config=config), platform
 
 
 def run_loop(
@@ -1005,6 +1005,93 @@ def run_loop(
             time.sleep(interval_seconds)
 
 
+def run_benchmark(
+    service: str,
+    episodes: int,
+    cycles_per_episode: int,
+    max_actions: int,
+    simulate: bool,
+    seed: int,
+    config: AgentConfig,
+) -> Dict[str, Any]:
+    episodes = max(1, min(200, int(episodes)))
+    cycles_per_episode = max(1, min(100, int(cycles_per_episode)))
+    max_actions = max(1, min(5, int(max_actions)))
+
+    total_cycles = 0
+    improved_cycles = 0
+    recovered_cycles = 0
+    total_risk_delta = 0.0
+    total_steps = 0
+    blocked_policy_steps = 0
+    severity_counts: Dict[str, int] = {}
+    action_counts: Dict[str, int] = {}
+
+    for episode_index in range(episodes):
+        with tempfile.TemporaryDirectory(prefix="devops_agent_bench_") as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            memory_path = Path(temp_dir) / "memory.json"
+            episode_seed = seed + episode_index * 9973
+            random.seed(episode_seed)
+            agent, platform = build_agent(state_path=state_path, memory_path=memory_path, config=config)
+            platform.ensure_service(service)
+
+            for _ in range(cycles_per_episode):
+                report = agent.run_healing_cycle(
+                    service=service,
+                    inject_event=simulate,
+                    max_actions=max_actions,
+                )
+                total_cycles += 1
+                if report.get("improved"):
+                    improved_cycles += 1
+
+                before_status = report.get("before", {}).get("status")
+                after_status = report.get("after", {}).get("status")
+                if before_status in {"degraded", "failed"} and after_status == "healthy":
+                    recovered_cycles += 1
+
+                risk_delta = float(report.get("risk_delta", 0.0))
+                total_risk_delta += risk_delta
+                steps = report.get("steps", [])
+                total_steps += len(steps)
+
+                severity = str(report.get("severity", "unknown"))
+                severity_counts[severity] = severity_counts.get(severity, 0) + 1
+
+                for step in steps:
+                    chosen_name = step.get("chosen_action", {}).get("name", "observe_only")
+                    if chosen_name != "observe_only":
+                        action_counts[chosen_name] = action_counts.get(chosen_name, 0) + 1
+                    ranked = step.get("ranked_candidates", [])
+                    if chosen_name == "observe_only" and ranked:
+                        top = ranked[0]
+                        if top.get("blocked"):
+                            blocked_policy_steps += 1
+
+    improved_rate = (improved_cycles / total_cycles * 100.0) if total_cycles else 0.0
+    recovered_rate = (recovered_cycles / total_cycles * 100.0) if total_cycles else 0.0
+    avg_risk_delta = (total_risk_delta / total_cycles) if total_cycles else 0.0
+    avg_steps = (total_steps / total_cycles) if total_cycles else 0.0
+
+    return {
+        "episodes": episodes,
+        "cycles_per_episode": cycles_per_episode,
+        "total_cycles": total_cycles,
+        "simulate": simulate,
+        "max_actions": max_actions,
+        "improved_cycles": improved_cycles,
+        "improved_rate_percent": round(improved_rate, 2),
+        "recovered_to_healthy_cycles": recovered_cycles,
+        "recovered_rate_percent": round(recovered_rate, 2),
+        "average_risk_delta": round(avg_risk_delta, 3),
+        "average_steps_per_cycle": round(avg_steps, 3),
+        "blocked_policy_steps": blocked_policy_steps,
+        "severity_counts": severity_counts,
+        "action_counts": action_counts,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Python-only autonomous AI DevOps agent with self-healing deployment actions."
@@ -1013,6 +1100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-file", default="deployment_state.json", help="Path to persisted deployment state.")
     parser.add_argument("--memory-file", default="agent_memory.json", help="Path to persisted agent memory.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for repeatable simulations.")
+    parser.add_argument("--config-file", default="", help="Optional JSON file for advanced policy/scoring config.")
 
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="Interactive chatbot mode (default).")
@@ -1038,6 +1126,28 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("memory", help="Show memory statistics from past actions.")
     report_parser = subparsers.add_parser("report", help="Show the latest healing report.")
     report_parser.add_argument("--json", action="store_true", help="Print full report as JSON.")
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="Run simulation benchmark and print reliability metrics.")
+    benchmark_parser.add_argument("--episodes", type=int, default=20, help="Number of benchmark episodes.")
+    benchmark_parser.add_argument("--cycles", type=int, default=8, help="Cycles per episode.")
+    benchmark_parser.add_argument("--max-actions", type=int, default=2, help="Maximum remediation actions per cycle.")
+    benchmark_parser.add_argument("--json", action="store_true", help="Print benchmark result as JSON.")
+    simulate_group = benchmark_parser.add_mutually_exclusive_group()
+    simulate_group.add_argument(
+        "--simulate",
+        dest="simulate",
+        action="store_true",
+        default=True,
+        help="Inject random incidents during benchmark (default).",
+    )
+    simulate_group.add_argument(
+        "--no-simulate",
+        dest="simulate",
+        action="store_false",
+        help="Run benchmark without injecting incidents.",
+    )
+
+    subparsers.add_parser("config", help="Print the active merged agent config.")
     return parser.parse_args()
 
 
@@ -1045,12 +1155,21 @@ def main() -> None:
     args = parse_args()
     random.seed(args.seed)
 
-    state_path = Path(args.state_file)
-    memory_path = Path(args.memory_file)
-    agent, platform = build_agent(state_path=state_path, memory_path=memory_path)
-    platform.ensure_service(args.service)
+    config_path = Path(args.config_file) if args.config_file else None
+    try:
+        config = load_agent_config(config_path)
+    except ValueError as err:
+        raise SystemExit(str(err))
 
     command = args.command or "chat"
+    if command == "config":
+        print(json.dumps(config.to_dict(), indent=2))
+        return
+
+    state_path = Path(args.state_file)
+    memory_path = Path(args.memory_file)
+    agent, platform = build_agent(state_path=state_path, memory_path=memory_path, config=config)
+    platform.ensure_service(args.service)
 
     if command == "status":
         if args.simulate:
@@ -1106,6 +1225,33 @@ def main() -> None:
             print(json.dumps(latest, indent=2))
         else:
             print(format_detailed_report(latest))
+        return
+
+    if command == "benchmark":
+        benchmark = run_benchmark(
+            service=args.service,
+            episodes=max(1, int(args.episodes)),
+            cycles_per_episode=max(1, int(args.cycles)),
+            max_actions=max(1, min(5, int(args.max_actions))),
+            simulate=bool(args.simulate),
+            seed=int(args.seed),
+            config=config,
+        )
+        if args.json:
+            print(json.dumps(benchmark, indent=2))
+        else:
+            print(
+                "Benchmark Summary\n"
+                f"episodes={benchmark['episodes']}, cycles_per_episode={benchmark['cycles_per_episode']}, "
+                f"total_cycles={benchmark['total_cycles']}\n"
+                f"improved_rate={benchmark['improved_rate_percent']}%, "
+                f"recovered_rate={benchmark['recovered_rate_percent']}%\n"
+                f"avg_risk_delta={benchmark['average_risk_delta']}, "
+                f"avg_steps={benchmark['average_steps_per_cycle']}, "
+                f"blocked_policy_steps={benchmark['blocked_policy_steps']}\n"
+                f"severity_counts={benchmark['severity_counts']}\n"
+                f"action_counts={benchmark['action_counts']}"
+            )
         return
 
     chatbot = DevOpsChatbot(agent, platform, args.service)

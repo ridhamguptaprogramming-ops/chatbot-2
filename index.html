@@ -51,6 +51,13 @@
         background: linear-gradient(90deg, #ecfeff, #eff6ff);
       }
 
+      .topbar-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.8rem;
+      }
+
       .title {
         margin: 0;
         font-size: 1.2rem;
@@ -61,6 +68,34 @@
         margin: 0.25rem 0 0;
         color: var(--muted);
         font-size: 0.9rem;
+      }
+
+      .health-pill {
+        border-radius: 999px;
+        padding: 0.25rem 0.7rem;
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        border: 1px solid transparent;
+        white-space: nowrap;
+      }
+
+      .health-pill.healthy {
+        color: #166534;
+        background: #dcfce7;
+        border-color: #86efac;
+      }
+
+      .health-pill.degraded {
+        color: #92400e;
+        background: #fef3c7;
+        border-color: #fcd34d;
+      }
+
+      .health-pill.failed {
+        color: #991b1b;
+        background: #fee2e2;
+        border-color: #fca5a5;
       }
 
       .messages {
@@ -79,6 +114,8 @@
         padding: 0.7rem 0.85rem;
         line-height: 1.4;
         white-space: pre-wrap;
+        display: grid;
+        gap: 0.35rem;
       }
 
       .msg.bot {
@@ -107,6 +144,38 @@
         padding: 0.35rem 0.65rem;
         font-size: 0.82rem;
         cursor: pointer;
+      }
+
+      .msg-text {
+        margin: 0;
+      }
+
+      .msg-time {
+        font-size: 0.72rem;
+        color: var(--muted);
+        opacity: 0.9;
+      }
+
+      .typing {
+        font-style: italic;
+        color: #075985;
+      }
+
+      .typing-dots::after {
+        content: " ...";
+        animation: pulse 1s infinite;
+      }
+
+      @keyframes pulse {
+        0% {
+          opacity: 0.3;
+        }
+        50% {
+          opacity: 1;
+        }
+        100% {
+          opacity: 0.3;
+        }
       }
 
       .composer {
@@ -163,8 +232,13 @@
   <body>
     <section class="chatbot">
       <header class="topbar">
-        <h1 class="title">AI DevOps Chatbot</h1>
-        <p class="subtitle">HTML chatbot UI for deployment support</p>
+        <div class="topbar-row">
+          <div>
+            <h1 class="title">AI DevOps Chatbot</h1>
+            <p class="subtitle">HTML chatbot UI for deployment support</p>
+          </div>
+          <div id="health-pill" class="health-pill healthy">HEALTHY</div>
+        </div>
       </header>
 
       <div id="messages" class="messages"></div>
@@ -173,7 +247,9 @@
         <button type="button" class="chip" data-q="status">Status</button>
         <button type="button" class="chip" data-q="simulate incident">Simulate Incident</button>
         <button type="button" class="chip" data-q="heal now">Heal</button>
+        <button type="button" class="chip" data-q="deployment summary">Summary</button>
         <button type="button" class="chip" data-q="help">Help</button>
+        <button type="button" class="chip" id="clear-chat-btn">Clear Chat</button>
       </div>
 
       <form id="chat-form" class="composer">
@@ -181,7 +257,7 @@
         <button class="send" type="submit">Send</button>
       </form>
 
-      <div class="meta">Tip: ask about status, errors, latency, heal, rollback, or scaling.</div>
+      <div class="meta">Tip: ask about status, summary, errors, latency, heal, rollback, scaling, or clear.</div>
     </section>
 
     <script>
@@ -189,6 +265,8 @@
       const form = document.getElementById("chat-form");
       const input = document.getElementById("chat-input");
       const chips = document.querySelectorAll(".chip");
+      const clearChatBtn = document.getElementById("clear-chat-btn");
+      const healthPill = document.getElementById("health-pill");
 
       const state = {
         service: "payments-api",
@@ -201,12 +279,57 @@
         replicas: "3/3",
       };
 
+      function timestamp() {
+        return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+
+      function evaluateHealthStatus() {
+        if (state.errorRate >= 8 || state.latency >= 1200) {
+          state.status = "failed";
+        } else if (state.errorRate >= 2 || state.latency >= 300 || state.cpu >= 80 || state.memory >= 85) {
+          state.status = "degraded";
+        } else {
+          state.status = "healthy";
+        }
+      }
+
+      function updateHealthPill() {
+        evaluateHealthStatus();
+        healthPill.classList.remove("healthy", "degraded", "failed");
+        healthPill.classList.add(state.status);
+        healthPill.textContent = state.status.toUpperCase();
+      }
+
       function addMessage(role, text) {
         const div = document.createElement("div");
         div.className = `msg ${role}`;
-        div.textContent = text;
+
+        const textNode = document.createElement("p");
+        textNode.className = "msg-text";
+        textNode.textContent = text;
+
+        const timeNode = document.createElement("span");
+        timeNode.className = "msg-time";
+        timeNode.textContent = timestamp();
+
+        div.appendChild(textNode);
+        div.appendChild(timeNode);
         messages.appendChild(div);
         messages.scrollTop = messages.scrollHeight;
+      }
+
+      function addTypingMessage() {
+        const typing = document.createElement("div");
+        typing.className = "msg bot typing";
+        typing.id = "bot-typing";
+        typing.innerHTML = '<span class="typing-dots">Bot is typing</span>';
+        messages.appendChild(typing);
+        messages.scrollTop = messages.scrollHeight;
+      }
+
+      function removeTypingMessage() {
+        const typing = document.getElementById("bot-typing");
+        if (typing) typing.remove();
       }
 
       function formatStatus() {
@@ -220,12 +343,24 @@
         );
       }
 
+      function deploymentSummary() {
+        const risk = state.errorRate * 5 + state.latency / 40 + Math.max(0, state.cpu - 75) + Math.max(0, state.memory - 80);
+        return (
+          `Deployment Summary\n` +
+          `Health: ${state.status}\n` +
+          `Risk Score: ${risk.toFixed(1)}\n` +
+          `Service: ${state.service}\n` +
+          `Version: ${state.version}\n` +
+          `Replicas: ${state.replicas}`
+        );
+      }
+
       function healState() {
         state.errorRate = Math.max(0.4, state.errorRate * 0.55);
         state.latency = Math.max(110, Math.round(state.latency * 0.82));
         state.cpu = Math.max(35, Math.round(state.cpu * 0.88));
         state.memory = Math.max(40, Math.round(state.memory * 0.86));
-        state.status = state.errorRate < 2 ? "healthy" : "degraded";
+        evaluateHealthStatus();
       }
 
       function simulateIncident() {
@@ -233,71 +368,86 @@
         state.latency = Math.min(2500, state.latency + 320);
         state.cpu = Math.min(100, state.cpu + 18);
         state.memory = Math.min(100, state.memory + 13);
-        state.status = "degraded";
+        evaluateHealthStatus();
       }
 
       function getBotReply(text) {
         const msg = text.toLowerCase().trim();
 
-        if (!msg) return "Please type a message.";
-        if (msg.includes("help")) {
-          return "Commands: status, simulate incident, heal now, rollback, scale, errors, latency.";
-        }
-        if (msg.includes("status")) {
-          return formatStatus();
-        }
-        if (msg.includes("simulate")) {
+        let response = "";
+
+        if (!msg) {
+          response = "Please type a message.";
+        } else if (msg.includes("help")) {
+          response = "Commands: status, summary, simulate incident, heal now, rollback, scale, errors, latency, clear chat.";
+        } else if (msg.includes("status")) {
+          response = formatStatus();
+        } else if (msg.includes("summary")) {
+          response = deploymentSummary();
+        } else if (msg.includes("simulate")) {
           simulateIncident();
-          return "Incident simulated.\n" + formatStatus();
-        }
-        if (msg.includes("heal") || msg.includes("fix")) {
+          response = "Incident simulated.\n" + formatStatus();
+        } else if (msg.includes("heal") || msg.includes("fix")) {
           healState();
-          return "Self-healing action completed: restart + cache clear.\n" + formatStatus();
-        }
-        if (msg.includes("rollback")) {
+          response = "Self-healing action completed: restart + cache clear.\n" + formatStatus();
+        } else if (msg.includes("rollback")) {
           state.version = "1.3.0";
           healState();
-          state.status = "healthy";
-          return "Rollback executed to v1.3.0.\n" + formatStatus();
-        }
-        if (msg.includes("scale")) {
+          response = "Rollback executed to v1.3.0.\n" + formatStatus();
+        } else if (msg.includes("scale")) {
           state.replicas = "4/4";
           state.cpu = Math.max(30, state.cpu - 12);
           state.latency = Math.max(110, state.latency - 80);
-          state.status = state.errorRate > 3 ? "degraded" : "healthy";
-          return "Scaled deployment to 4 replicas.\n" + formatStatus();
+          evaluateHealthStatus();
+          response = "Scaled deployment to 4 replicas.\n" + formatStatus();
+        } else if (msg.includes("error")) {
+          response = `Current error rate is ${state.errorRate.toFixed(2)}%.`;
+        } else if (msg.includes("latency")) {
+          response = `Current latency is ${state.latency}ms.`;
+        } else if (msg.includes("clear")) {
+          messages.innerHTML = "";
+          response = "Chat cleared. Ready for new deployment checks.";
+        } else {
+          response = "I can help with status, summary, incidents, healing, rollback, and scaling.";
         }
-        if (msg.includes("error")) {
-          return `Current error rate is ${state.errorRate.toFixed(2)}%.`;
-        }
-        if (msg.includes("latency")) {
-          return `Current latency is ${state.latency}ms.`;
-        }
-        return "I can help with status, incidents, healing, rollback, and scaling.";
+
+        updateHealthPill();
+        return response;
+      }
+
+      function respondToUser(text, delayMs) {
+        addMessage("user", text);
+        const reply = getBotReply(text);
+        addTypingMessage();
+        window.setTimeout(() => {
+          removeTypingMessage();
+          addMessage("bot", reply);
+        }, delayMs);
       }
 
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         const text = input.value.trim();
         if (!text) return;
-
-        addMessage("user", text);
         input.value = "";
-
-        const reply = getBotReply(text);
-        window.setTimeout(() => addMessage("bot", reply), 220);
+        respondToUser(text, 220);
       });
 
       chips.forEach((chip) => {
         chip.addEventListener("click", () => {
+          if (chip.id === "clear-chat-btn") return;
           const text = chip.getAttribute("data-q") || "";
-          addMessage("user", text);
-          const reply = getBotReply(text);
-          window.setTimeout(() => addMessage("bot", reply), 150);
+          respondToUser(text, 150);
         });
       });
 
-      addMessage("bot", "Hello, I am your DevOps chatbot. Ask me for status or type help.");
+      clearChatBtn.addEventListener("click", () => {
+        messages.innerHTML = "";
+        addMessage("bot", "Chat history cleared. Ask for status, summary, or heal.");
+      });
+
+      updateHealthPill();
+      addMessage("bot", "Hello, I am your DevOps chatbot. Ask me for status, summary, or type help.");
     </script>
   </body>
 </html>
