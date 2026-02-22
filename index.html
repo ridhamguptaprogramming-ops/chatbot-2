@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI DevOps Chatbot</title>
+    <style>
+      :root {
+        --bg-a: #fef3c7;
+        --bg-b: #e0f2fe;
+        --card: #ffffff;
+        --text: #1f2937;
+        --muted: #6b7280;
+        --border: #d1d5db;
+        --bot: #e0f2fe;
+        --user: #dcfce7;
+        --accent: #0f766e;
+        --accent-hover: #115e59;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 1.25rem;
+        color: var(--text);
+        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at 10% 10%, var(--bg-a) 0%, transparent 45%),
+          radial-gradient(circle at 90% 90%, #bfdbfe 0%, transparent 40%),
+          linear-gradient(140deg, #f8fafc, var(--bg-b));
+      }
+
+      .chatbot {
+        width: min(880px, 100%);
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
+        overflow: hidden;
+      }
+
+      .topbar {
+        padding: 1rem 1.2rem;
+        border-bottom: 1px solid var(--border);
+        background: linear-gradient(90deg, #ecfeff, #eff6ff);
+      }
+
+      .title {
+        margin: 0;
+        font-size: 1.2rem;
+        font-weight: 700;
+      }
+
+      .subtitle {
+        margin: 0.25rem 0 0;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .messages {
+        height: 430px;
+        overflow-y: auto;
+        padding: 1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        background: #f8fafc;
+      }
+
+      .msg {
+        max-width: min(78%, 680px);
+        border-radius: 12px;
+        padding: 0.7rem 0.85rem;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+
+      .msg.bot {
+        background: var(--bot);
+        border: 1px solid #bae6fd;
+        align-self: flex-start;
+      }
+
+      .msg.user {
+        background: var(--user);
+        border: 1px solid #bbf7d0;
+        align-self: flex-end;
+      }
+
+      .controls {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        padding: 0.7rem 1rem 0;
+      }
+
+      .chip {
+        border: 1px solid var(--border);
+        background: #ffffff;
+        border-radius: 999px;
+        padding: 0.35rem 0.65rem;
+        font-size: 0.82rem;
+        cursor: pointer;
+      }
+
+      .composer {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 0.6rem;
+        padding: 0.9rem 1rem 1rem;
+      }
+
+      .input {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 0.7rem 0.8rem;
+        font-size: 1rem;
+        outline: none;
+      }
+
+      .input:focus {
+        border-color: #2dd4bf;
+        box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.2);
+      }
+
+      .send {
+        border: 0;
+        border-radius: 10px;
+        padding: 0.65rem 1rem;
+        color: #fff;
+        background: var(--accent);
+        cursor: pointer;
+        font-weight: 600;
+      }
+
+      .send:hover {
+        background: var(--accent-hover);
+      }
+
+      .meta {
+        padding: 0 1rem 1rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+
+      @media (max-width: 700px) {
+        .messages {
+          height: 56vh;
+        }
+
+        .msg {
+          max-width: 90%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <section class="chatbot">
+      <header class="topbar">
+        <h1 class="title">AI DevOps Chatbot</h1>
+        <p class="subtitle">HTML chatbot UI for deployment support</p>
+      </header>
+
+      <div id="messages" class="messages"></div>
+
+      <div class="controls">
+        <button type="button" class="chip" data-q="status">Status</button>
+        <button type="button" class="chip" data-q="simulate incident">Simulate Incident</button>
+        <button type="button" class="chip" data-q="heal now">Heal</button>
+        <button type="button" class="chip" data-q="help">Help</button>
+      </div>
+
+      <form id="chat-form" class="composer">
+        <input id="chat-input" class="input" type="text" placeholder="Type message..." autocomplete="off" required />
+        <button class="send" type="submit">Send</button>
+      </form>
+
+      <div class="meta">Tip: ask about status, errors, latency, heal, rollback, or scaling.</div>
+    </section>
+
+    <script>
+      const messages = document.getElementById("messages");
+      const form = document.getElementById("chat-form");
+      const input = document.getElementById("chat-input");
+      const chips = document.querySelectorAll(".chip");
+
+      const state = {
+        service: "payments-api",
+        version: "1.3.1",
+        status: "healthy",
+        errorRate: 1.2,
+        latency: 140,
+        cpu: 48,
+        memory: 56,
+        replicas: "3/3",
+      };
+
+      function addMessage(role, text) {
+        const div = document.createElement("div");
+        div.className = `msg ${role}`;
+        div.textContent = text;
+        messages.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+      }
+
+      function formatStatus() {
+        return (
+          `Service: ${state.service} v${state.version}\n` +
+          `Status: ${state.status}\n` +
+          `Error Rate: ${state.errorRate.toFixed(2)}%\n` +
+          `Latency: ${state.latency}ms\n` +
+          `CPU: ${state.cpu}% | Memory: ${state.memory}%\n` +
+          `Replicas: ${state.replicas}`
+        );
+      }
+
+      function healState() {
+        state.errorRate = Math.max(0.4, state.errorRate * 0.55);
+        state.latency = Math.max(110, Math.round(state.latency * 0.82));
+        state.cpu = Math.max(35, Math.round(state.cpu * 0.88));
+        state.memory = Math.max(40, Math.round(state.memory * 0.86));
+        state.status = state.errorRate < 2 ? "healthy" : "degraded";
+      }
+
+      function simulateIncident() {
+        state.errorRate = Math.min(20, state.errorRate + 2.8);
+        state.latency = Math.min(2500, state.latency + 320);
+        state.cpu = Math.min(100, state.cpu + 18);
+        state.memory = Math.min(100, state.memory + 13);
+        state.status = "degraded";
+      }
+
+      function getBotReply(text) {
+        const msg = text.toLowerCase().trim();
+
+        if (!msg) return "Please type a message.";
+        if (msg.includes("help")) {
+          return "Commands: status, simulate incident, heal now, rollback, scale, errors, latency.";
+        }
+        if (msg.includes("status")) {
+          return formatStatus();
+        }
+        if (msg.includes("simulate")) {
+          simulateIncident();
+          return "Incident simulated.\n" + formatStatus();
+        }
+        if (msg.includes("heal") || msg.includes("fix")) {
+          healState();
+          return "Self-healing action completed: restart + cache clear.\n" + formatStatus();
+        }
+        if (msg.includes("rollback")) {
+          state.version = "1.3.0";
+          healState();
+          state.status = "healthy";
+          return "Rollback executed to v1.3.0.\n" + formatStatus();
+        }
+        if (msg.includes("scale")) {
+          state.replicas = "4/4";
+          state.cpu = Math.max(30, state.cpu - 12);
+          state.latency = Math.max(110, state.latency - 80);
+          state.status = state.errorRate > 3 ? "degraded" : "healthy";
+          return "Scaled deployment to 4 replicas.\n" + formatStatus();
+        }
+        if (msg.includes("error")) {
+          return `Current error rate is ${state.errorRate.toFixed(2)}%.`;
+        }
+        if (msg.includes("latency")) {
+          return `Current latency is ${state.latency}ms.`;
+        }
+        return "I can help with status, incidents, healing, rollback, and scaling.";
+      }
+
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = input.value.trim();
+        if (!text) return;
+
+        addMessage("user", text);
+        input.value = "";
+
+        const reply = getBotReply(text);
+        window.setTimeout(() => addMessage("bot", reply), 220);
+      });
+
+      chips.forEach((chip) => {
+        chip.addEventListener("click", () => {
+          const text = chip.getAttribute("data-q") || "";
+          addMessage("user", text);
+          const reply = getBotReply(text);
+          window.setTimeout(() => addMessage("bot", reply), 150);
+        });
+      });
+
+      addMessage("bot", "Hello, I am your DevOps chatbot. Ask me for status or type help.");
+    </script>
+  </body>
+</html>
