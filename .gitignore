@@ -2,4 +2,4 @@
 __pycache__/
 deployment_state.json
 agent_memory.json
-
+chat_history.json

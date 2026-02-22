@@ -270,6 +270,7 @@
         <div class="metric-chip">CPU <strong id="metric-cpu">48%</strong></div>
         <div class="metric-chip">Memory <strong id="metric-memory">56%</strong></div>
         <div class="metric-chip">Replicas <strong id="metric-replicas">3/3</strong></div>
+        <div class="metric-chip">Stability <strong id="metric-stability">--</strong></div>
       </div>
 
       <div id="messages" class="messages"></div>
@@ -279,6 +280,7 @@
         <button type="button" class="chip" data-q="simulate incident">Simulate Incident</button>
         <button type="button" class="chip" data-q="heal now">Heal</button>
         <button type="button" class="chip" data-q="deployment summary">Summary</button>
+        <button type="button" class="chip" data-q="analytics">Analytics</button>
         <button type="button" class="chip" data-q="help">Help</button>
         <button type="button" class="chip" id="clear-chat-btn">Clear Chat</button>
       </div>
@@ -288,7 +290,7 @@
         <button class="send" type="submit">Send</button>
       </form>
 
-      <div class="meta">Tip: ask about status, summary, errors, latency, heal, rollback, scaling, or clear. Press `/` to focus input.</div>
+      <div class="meta">Tip: ask about status, summary, analytics, errors, latency, heal, rollback, scaling, or clear. Press `/` to focus input.</div>
     </section>
 
     <script>
@@ -303,37 +305,64 @@
       const metricCpu = document.getElementById("metric-cpu");
       const metricMemory = document.getElementById("metric-memory");
       const metricReplicas = document.getElementById("metric-replicas");
+      const metricStability = document.getElementById("metric-stability");
+      const API_BASE_STORAGE_KEY = "devops_backend_base";
+      const api = {
+        state: "/api/state",
+        analytics: "/api/analytics",
+        history: "/api/history",
+        chat: "/api/chat",
+        clear: "/api/history/clear",
+      };
+      const queryApiBase = new URLSearchParams(window.location.search).get("api") || "";
+      let apiBase = normalizeBaseUrl(queryApiBase || window.localStorage.getItem(API_BASE_STORAGE_KEY) || "");
+      if (queryApiBase) {
+        window.localStorage.setItem(API_BASE_STORAGE_KEY, apiBase);
+      }
 
       const state = {
         service: "payments-api",
-        version: "1.3.1",
+        version: "-",
         status: "healthy",
         errorRate: 1.2,
         latency: 140,
         cpu: 48,
         memory: 56,
         replicas: "3/3",
+        stability: null,
       };
 
       function timestamp() {
         return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       }
 
-      function evaluateHealthStatus() {
-        if (state.errorRate >= 8 || state.latency >= 1200) {
-          state.status = "failed";
-        } else if (state.errorRate >= 2 || state.latency >= 300 || state.cpu >= 80 || state.memory >= 85) {
-          state.status = "degraded";
-        } else {
-          state.status = "healthy";
+      function normalizeBaseUrl(raw) {
+        const text = String(raw || "").trim();
+        if (!text) return "";
+
+        let normalized = text.replace(/\/+$/, "");
+        normalized = normalized.replace(/\/index\.html$/i, "");
+        normalized = normalized.replace(/\/api$/i, "");
+
+        try {
+          const parsed = new URL(normalized);
+          const path = parsed.pathname.replace(/\/+$/, "");
+          return `${parsed.origin}${path && path !== "/" ? path : ""}`;
+        } catch (err) {
+          return normalized;
         }
       }
 
+      function resolveApiUrl(path, base = apiBase) {
+        if (!base) return path;
+        return `${base}${path}`;
+      }
+
       function updateHealthPill() {
-        evaluateHealthStatus();
+        const safeStatus = ["healthy", "degraded", "failed"].includes(state.status) ? state.status : "healthy";
         healthPill.classList.remove("healthy", "degraded", "failed");
-        healthPill.classList.add(state.status);
-        healthPill.textContent = state.status.toUpperCase();
+        healthPill.classList.add(safeStatus);
+        healthPill.textContent = safeStatus.toUpperCase();
         updateSnapshot();
       }
 
@@ -343,9 +372,10 @@
         metricCpu.textContent = `${state.cpu}%`;
         metricMemory.textContent = `${state.memory}%`;
         metricReplicas.textContent = state.replicas;
+        metricStability.textContent = Number.isFinite(state.stability) ? `${state.stability}/100` : "--";
       }
 
-      function addMessage(role, text) {
+      function addMessage(role, text, isoTimestamp = "") {
         const div = document.createElement("div");
         div.className = `msg ${role}`;
 
@@ -355,7 +385,16 @@
 
         const timeNode = document.createElement("span");
         timeNode.className = "msg-time";
-        timeNode.textContent = timestamp();
+        if (isoTimestamp) {
+          const parsed = new Date(isoTimestamp);
+          if (!Number.isNaN(parsed.getTime())) {
+            timeNode.textContent = parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          } else {
+            timeNode.textContent = timestamp();
+          }
+        } else {
+          timeNode.textContent = timestamp();
+        }
 
         div.appendChild(textNode);
         div.appendChild(timeNode);
@@ -377,97 +416,171 @@
         if (typing) typing.remove();
       }
 
-      function formatStatus() {
-        return (
-          `Service: ${state.service} v${state.version}\n` +
-          `Status: ${state.status}\n` +
-          `Error Rate: ${state.errorRate.toFixed(2)}%\n` +
-          `Latency: ${state.latency}ms\n` +
-          `CPU: ${state.cpu}% | Memory: ${state.memory}%\n` +
-          `Replicas: ${state.replicas}`
-        );
+      function applyStateSnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== "object") return;
+        if (typeof snapshot.service === "string") state.service = snapshot.service;
+        if (typeof snapshot.version === "string") state.version = snapshot.version;
+        if (typeof snapshot.status === "string") state.status = snapshot.status;
+
+        if (typeof snapshot.error_rate === "number") state.errorRate = snapshot.error_rate;
+        if (typeof snapshot.latency_ms === "number") state.latency = snapshot.latency_ms;
+        if (typeof snapshot.cpu_percent === "number") state.cpu = snapshot.cpu_percent;
+        if (typeof snapshot.memory_percent === "number") state.memory = snapshot.memory_percent;
+        if (typeof snapshot.ready_replicas === "number" && typeof snapshot.desired_replicas === "number") {
+          state.replicas = `${snapshot.ready_replicas}/${snapshot.desired_replicas}`;
+        }
+        updateHealthPill();
       }
 
-      function deploymentSummary() {
-        const risk = state.errorRate * 5 + state.latency / 40 + Math.max(0, state.cpu - 75) + Math.max(0, state.memory - 80);
-        return (
-          `Deployment Summary\n` +
-          `Health: ${state.status}\n` +
-          `Risk Score: ${risk.toFixed(1)}\n` +
-          `Service: ${state.service}\n` +
-          `Version: ${state.version}\n` +
-          `Replicas: ${state.replicas}`
-        );
+      function applyAnalyticsSnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== "object") return;
+        if (typeof snapshot.stability_score === "number") {
+          state.stability = Number(snapshot.stability_score.toFixed(2));
+          updateSnapshot();
+        }
       }
 
-      function healState() {
-        state.errorRate = Math.max(0.4, state.errorRate * 0.55);
-        state.latency = Math.max(110, Math.round(state.latency * 0.82));
-        state.cpu = Math.max(35, Math.round(state.cpu * 0.88));
-        state.memory = Math.max(40, Math.round(state.memory * 0.86));
-        evaluateHealthStatus();
+      function normalizeRole(role) {
+        if (role === "assistant" || role === "bot" || role === "system") return "bot";
+        return "user";
       }
 
-      function simulateIncident() {
-        state.errorRate = Math.min(20, state.errorRate + 2.8);
-        state.latency = Math.min(2500, state.latency + 320);
-        state.cpu = Math.min(100, state.cpu + 18);
-        state.memory = Math.min(100, state.memory + 13);
-        evaluateHealthStatus();
+      function apiCandidates(allowFallback = true) {
+        const unique = new Set();
+        const primary = normalizeBaseUrl(apiBase);
+        if (primary) unique.add(primary);
+
+        if (allowFallback) {
+          unique.add("");
+          unique.add("http://127.0.0.1:8000");
+        }
+        return Array.from(unique);
       }
 
-      function getBotReply(text) {
-        const msg = text.toLowerCase().trim();
+      async function fetchJson(path, options = {}, allowFallback = true) {
+        const candidates = apiCandidates(allowFallback);
 
-        let response = "";
+        let lastError = null;
 
-        if (!msg) {
-          response = "Please type a message.";
-        } else if (msg.includes("help")) {
-          response = "Commands: status, summary, simulate incident, heal now, rollback, scale, errors, latency, clear chat.";
-        } else if (msg.includes("status")) {
-          response = formatStatus();
-        } else if (msg.includes("summary")) {
-          response = deploymentSummary();
-        } else if (msg.includes("simulate")) {
-          simulateIncident();
-          response = "Incident simulated.\n" + formatStatus();
-        } else if (msg.includes("heal") || msg.includes("fix")) {
-          healState();
-          response = "Self-healing action completed: restart + cache clear.\n" + formatStatus();
-        } else if (msg.includes("rollback")) {
-          state.version = "1.3.0";
-          healState();
-          response = "Rollback executed to v1.3.0.\n" + formatStatus();
-        } else if (msg.includes("scale")) {
-          state.replicas = "4/4";
-          state.cpu = Math.max(30, state.cpu - 12);
-          state.latency = Math.max(110, state.latency - 80);
-          evaluateHealthStatus();
-          response = "Scaled deployment to 4 replicas.\n" + formatStatus();
-        } else if (msg.includes("error")) {
-          response = `Current error rate is ${state.errorRate.toFixed(2)}%.`;
-        } else if (msg.includes("latency")) {
-          response = `Current latency is ${state.latency}ms.`;
-        } else if (msg.includes("clear")) {
-          messages.innerHTML = "";
-          response = "Chat cleared. Ready for new deployment checks.";
-        } else {
-          response = "I can help with status, summary, incidents, healing, rollback, and scaling.";
+        for (const candidateBase of candidates) {
+          const url = resolveApiUrl(path, candidateBase);
+          try {
+            const response = await fetch(url, options);
+            let payload = {};
+            try {
+              payload = await response.json();
+            } catch (err) {
+              payload = {};
+            }
+            if (!response.ok) {
+              const message = payload && payload.error ? payload.error : `Request failed (${response.status})`;
+              throw new Error(message);
+            }
+
+            if (candidateBase && candidateBase !== apiBase) {
+              apiBase = candidateBase;
+              window.localStorage.setItem(API_BASE_STORAGE_KEY, apiBase);
+            }
+            return payload;
+          } catch (err) {
+            lastError = err;
+          }
         }
 
-        updateHealthPill();
-        return response;
+        throw lastError || new Error("Request failed");
       }
 
-      function respondToUser(text, delayMs) {
+      function renderHistory(history) {
+        messages.innerHTML = "";
+        if (!Array.isArray(history) || !history.length) {
+          addMessage("bot", "Hello, I am your DevOps chatbot backend. Ask me for status, summary, diagnose, heal, or analytics.");
+          return;
+        }
+        history.forEach((item) => {
+          if (!item || typeof item !== "object") return;
+          const role = normalizeRole(item.role);
+          const text = typeof item.text === "string" ? item.text : "";
+          const ts = typeof item.timestamp === "string" ? item.timestamp : "";
+          addMessage(role, text, ts);
+        });
+      }
+
+      async function loadInitialData() {
+        try {
+          const [stateResult, historyResult, analyticsResult] = await Promise.allSettled([
+            fetchJson(api.state),
+            fetchJson(`${api.history}?limit=150`),
+            fetchJson(`${api.analytics}?window=40`),
+          ]);
+
+          if (stateResult.status !== "fulfilled") {
+            throw stateResult.reason;
+          }
+          if (historyResult.status !== "fulfilled") {
+            throw historyResult.reason;
+          }
+
+          const statePayload = stateResult.value;
+          const historyPayload = historyResult.value;
+          if (statePayload && statePayload.state) {
+            applyStateSnapshot(statePayload.state);
+          }
+          if (analyticsResult.status === "fulfilled") {
+            const analyticsPayload = analyticsResult.value;
+            if (analyticsPayload && analyticsPayload.analytics) {
+              applyAnalyticsSnapshot(analyticsPayload.analytics);
+            }
+          }
+          renderHistory(historyPayload.messages || []);
+        } catch (err) {
+          messages.innerHTML = "";
+          addMessage(
+            "bot",
+            `Backend not reachable: ${err.message}\n` +
+              "Start backend: python3 server.py --host 127.0.0.1 --port 8000\n" +
+              "Or open page with ?api=http://127.0.0.1:8000"
+          );
+        }
+      }
+
+      async function refreshAnalytics() {
+        try {
+          const payload = await fetchJson(`${api.analytics}?window=40`);
+          if (payload && payload.analytics) {
+            applyAnalyticsSnapshot(payload.analytics);
+          }
+        } catch (err) {
+          // Ignore analytics refresh failures to keep chat responsive.
+        }
+      }
+
+      async function respondToUser(text, delayMs) {
         addMessage("user", text);
-        const reply = getBotReply(text);
         addTypingMessage();
-        window.setTimeout(() => {
+
+        const startedAt = Date.now();
+        try {
+          const payload = await fetchJson(api.chat, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: text,
+              max_actions: 2,
+            }),
+          });
+
+          const elapsed = Date.now() - startedAt;
+          const extraDelay = Math.max(0, delayMs - elapsed);
+          window.setTimeout(() => {
+            removeTypingMessage();
+            addMessage("bot", payload.reply || "No response received.", payload.timestamp || "");
+            if (payload.state) applyStateSnapshot(payload.state);
+            refreshAnalytics();
+          }, extraDelay);
+        } catch (err) {
           removeTypingMessage();
-          addMessage("bot", reply);
-        }, delayMs);
+          addMessage("bot", `Backend error: ${err.message}`);
+        }
       }
 
       form.addEventListener("submit", (event) => {
@@ -487,8 +600,18 @@
       });
 
       clearChatBtn.addEventListener("click", () => {
-        messages.innerHTML = "";
-        addMessage("bot", "Chat history cleared. Ask for status, summary, or heal.");
+        addTypingMessage();
+        fetchJson(api.clear, { method: "POST" })
+          .then((payload) => {
+            removeTypingMessage();
+            messages.innerHTML = "";
+            addMessage("bot", payload.reply || "Chat history cleared.", payload.timestamp || "");
+            if (payload.state) applyStateSnapshot(payload.state);
+          })
+          .catch((err) => {
+            removeTypingMessage();
+            addMessage("bot", `Clear failed: ${err.message}`);
+          });
       });
 
       window.addEventListener("keydown", (event) => {
@@ -499,7 +622,7 @@
       });
 
       updateHealthPill();
-      addMessage("bot", "Hello, I am your DevOps chatbot. Ask me for status, summary, or type help.");
+      loadInitialData();
     </script>
   </body>
 </html>

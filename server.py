@@ -16,6 +16,7 @@ from ai_devops_agent import (
     JsonFileStore,
     build_agent,
     format_detailed_report,
+    format_analytics_report,
     format_state,
     load_agent_config,
     summarize_report,
@@ -97,6 +98,12 @@ class BackendService:
         with self.lock:
             return self._state_snapshot_locked()
 
+    def get_analytics(self, window: int = 40) -> Dict[str, Any]:
+        with self.lock:
+            safe_window = max(1, min(600, int(window)))
+            analytics = self.agent.memory.analytics(service=self.service, window=safe_window)
+            return {"analytics": analytics}
+
     def _append_message(self, role: str, text: str, kind: str = "chat") -> Dict[str, Any]:
         next_id = int(self.chat_data.get("next_id", 1))
         message = {
@@ -128,7 +135,7 @@ class BackendService:
             self.chat_data["next_id"] = 1
             reply_message = self._append_message(
                 "assistant",
-                "Chat history cleared. Ask for status, summary, diagnose, heal, or report.",
+                "Chat history cleared. Ask for status, summary, diagnose, heal, report, or analytics.",
                 kind="system",
             )
             snapshot = self._state_snapshot_locked()
@@ -171,7 +178,10 @@ class BackendService:
         with self.lock:
             lowered = user_text.lower()
             if lowered in {"", " "}:
-                reply = "Please type a command. Try: status, summary, diagnose, heal, simulate, auto 5, report, memory."
+                reply = (
+                    "Please type a command. Try: status, summary, diagnose, heal, simulate, auto 5, report, "
+                    "memory, analytics."
+                )
                 assistant_message = self._append_message("assistant", reply, kind="system")
                 return {
                     "reply": reply,
@@ -188,7 +198,7 @@ class BackendService:
             if "help" in lowered:
                 reply = (
                     "Commands: status, summary, diagnose, heal, simulate, auto <cycles> <max_actions>, "
-                    "report, memory, clear."
+                    "report, memory, analytics <window>, clear."
                 )
             elif "status" in lowered:
                 reply = self._state_snapshot_locked()["formatted"]
@@ -213,7 +223,7 @@ class BackendService:
                     dry_run=False,
                 )
                 reply = summarize_report(report)
-            elif lowered.startswith("auto"):
+            elif re.match(r"^\s*auto(?:\s+\d+)?(?:\s+\d+)?\s*$", lowered):
                 cycles, parsed_actions = self._parse_auto_command(user_text)
                 summaries: List[str] = []
                 for index in range(1, cycles + 1):
@@ -233,6 +243,13 @@ class BackendService:
                     reply = format_detailed_report(latest)
             elif "memory" in lowered:
                 reply = self.agent.memory.summary()
+            elif "analytics" in lowered or "insight" in lowered or "stability" in lowered or "trend" in lowered:
+                parsed_window = 40
+                match = re.search(r"(\d+)", lowered)
+                if match:
+                    parsed_window = max(1, min(600, int(match.group(1))))
+                analytics = self.agent.memory.analytics(self.service, window=parsed_window)
+                reply = format_analytics_report(analytics)
             elif "error" in lowered:
                 snapshot = self._state_snapshot_locked()
                 reply = f"Current error rate is {snapshot['error_rate']:.2f}%."
@@ -241,7 +258,8 @@ class BackendService:
                 reply = f"Current latency is {snapshot['latency_ms']}ms."
             else:
                 reply = (
-                    "I can help with status, summary, diagnose, heal, simulate incidents, auto runs, report, and memory."
+                    "I can help with status, summary, diagnose, heal, simulate incidents, auto runs, report, "
+                    "memory, and analytics."
                 )
 
             assistant_message = self._append_message("assistant", reply, kind="assistant")
@@ -256,9 +274,22 @@ class AppRequestHandler(BaseHTTPRequestHandler):
     backend: Optional[BackendService] = None
     root_dir = Path(__file__).resolve().parent
 
+    @staticmethod
+    def _normalized_path(path: str) -> str:
+        normalized = re.sub(r"^/api(?:/api)+", "/api", path)
+        if len(normalized) > 1:
+            normalized = normalized.rstrip("/")
+        return normalized or "/"
+
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
     def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status_code)
+        self._send_cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -267,6 +298,7 @@ class AppRequestHandler(BaseHTTPRequestHandler):
     def _send_text(self, status_code: int, content_type: str, body: str) -> None:
         data = body.encode("utf-8")
         self.send_response(status_code)
+        self._send_cors_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -303,7 +335,7 @@ class AppRequestHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = self._normalized_path(parsed.path)
 
         if path in {"/", "/index.html"}:
             self._serve_index()
@@ -315,6 +347,16 @@ class AppRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/state":
             self._send_json(HTTPStatus.OK, {"state": backend.get_state_snapshot()})
+            return
+
+        if path == "/api/analytics":
+            query = parse_qs(parsed.query)
+            raw_window = query.get("window", ["40"])[0]
+            try:
+                window = int(raw_window)
+            except ValueError:
+                window = 40
+            self._send_json(HTTPStatus.OK, backend.get_analytics(window=window))
             return
 
         if path == "/api/history":
@@ -329,6 +371,12 @@ class AppRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Route not found."})
 
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self) -> None:
         backend = self.backend
         if backend is None:
@@ -336,7 +384,7 @@ class AppRequestHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = self._normalized_path(parsed.path)
 
         try:
             if path == "/api/chat":
@@ -404,7 +452,10 @@ def main() -> None:
     AppRequestHandler.backend = backend
     server = ThreadingHTTPServer((args.host, int(args.port)), AppRequestHandler)
     print(f"Backend running on http://{args.host}:{args.port}")
-    print("Routes: GET /, GET /api/state, GET /api/history, POST /api/chat, POST /api/history/clear")
+    print(
+        "Routes: GET /, GET /api/state, GET /api/analytics, GET /api/history, "
+        "POST /api/chat, POST /api/history/clear"
+    )
 
     try:
         server.serve_forever()

@@ -493,6 +493,222 @@ class AgentMemory:
             return None
         return reports[-1] # type: ignore
 
+    @staticmethod
+    def _safe_float(raw_value: Any, default: float = 0.0) -> float:
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _trend_slope(values: List[float]) -> float:
+        sample_count = len(values)
+        if sample_count < 2:
+            return 0.0
+        x_mean = (sample_count - 1) / 2.0
+        y_mean = sum(values) / sample_count
+        numerator = 0.0
+        denominator = 0.0
+        for index, value in enumerate(values):
+            delta_x = index - x_mean
+            numerator += delta_x * (value - y_mean)
+            denominator += delta_x * delta_x
+        if denominator <= 0.0:
+            return 0.0
+        return numerator / denominator
+
+    def reports_for_service(self, service: str, window: int = 40) -> List[Dict[str, Any]]:
+        safe_window = max(1, min(600, int(window)))
+        reports = self.data.get("recent_reports", [])
+        if not isinstance(reports, list):
+            return []
+        filtered = [
+            item
+            for item in reports
+            if isinstance(item, dict) and str(item.get("service", "")) == service
+        ]
+        return filtered[-safe_window:]
+
+    def analytics(self, service: str, window: int = 40) -> Dict[str, Any]:
+        reports = self.reports_for_service(service, window=window)
+        safe_window = max(1, min(600, int(window)))
+        if not reports:
+            return {
+                "service": service,
+                "window_size": safe_window,
+                "sample_count": 0,
+                "time_range": {"start": "", "end": ""},
+                "improved_cycles": 0,
+                "improved_rate_percent": 0.0,
+                "recovered_to_healthy_cycles": 0,
+                "recovered_rate_percent": 0.0,
+                "average_risk_delta": 0.0,
+                "average_final_risk": 0.0,
+                "severity_counts": {},
+                "action_counts": {},
+                "policy_blocked_steps": 0,
+                "policy_blocked_ratio": 0.0,
+                "unhealthy_after_ratio": 0.0,
+                "trend": {
+                    "risk_slope": 0.0,
+                    "error_rate_slope": 0.0,
+                    "latency_ms_slope": 0.0,
+                },
+                "stability_score": 0.0,
+                "recommendation": "Run heal/auto cycles first so analytics has enough data.",
+            }
+
+        severity_counts: Dict[str, int] = {}
+        action_counts: Dict[str, int] = {}
+        improved_cycles = 0
+        degraded_or_failed_cycles = 0
+        recovered_cycles = 0
+        total_risk_delta = 0.0
+        total_steps = 0
+        blocked_policy_steps = 0
+        unhealthy_after_count = 0
+        final_risk_values: List[float] = []
+        error_rate_values: List[float] = []
+        latency_values: List[float] = []
+
+        for report in reports:
+            severity = str(report.get("severity", "unknown"))
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+
+            chosen = report.get("chosen_action", {})
+            chosen_name = "observe_only"
+            if isinstance(chosen, dict):
+                chosen_name = str(chosen.get("name", "observe_only"))
+            action_counts[chosen_name] = action_counts.get(chosen_name, 0) + 1
+
+            if bool(report.get("improved")):
+                improved_cycles += 1
+
+            total_risk_delta += self._safe_float(report.get("risk_delta"), default=0.0)
+
+            final_risk = self._safe_float(report.get("final_risk_score"), default=float("nan"))
+            if math.isfinite(final_risk):
+                final_risk_values.append(final_risk)
+
+            after_status = "unknown"
+            before_state = report.get("before", {})
+            if isinstance(before_state, dict):
+                before_status = str(before_state.get("status", "unknown"))
+                if before_status in {"degraded", "failed"}:
+                    degraded_or_failed_cycles += 1
+            else:
+                before_status = "unknown"
+
+            after_state = report.get("after", {})
+            if isinstance(after_state, dict):
+                after_status = str(after_state.get("status", "unknown"))
+                error_rate_values.append(self._safe_float(after_state.get("error_rate"), default=0.0))
+                latency_values.append(self._safe_float(after_state.get("latency_ms"), default=0.0))
+                if after_status in {"degraded", "failed"}:
+                    unhealthy_after_count += 1
+
+            if before_status in {"degraded", "failed"} and after_status == "healthy":
+                recovered_cycles += 1
+
+            steps = report.get("steps", [])
+            if isinstance(steps, list):
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    total_steps += 1
+                    step_chosen = step.get("chosen_action", {})
+                    step_chosen_name = "observe_only"
+                    if isinstance(step_chosen, dict):
+                        step_chosen_name = str(step_chosen.get("name", "observe_only"))
+                    ranked = step.get("ranked_candidates", [])
+                    top_blocked = False
+                    if isinstance(ranked, list) and ranked:
+                        first = ranked[0]
+                        if isinstance(first, dict):
+                            top_blocked = bool(first.get("blocked"))
+                    if step_chosen_name == "observe_only" and top_blocked:
+                        blocked_policy_steps += 1
+
+        sample_count = len(reports)
+        improved_rate = (improved_cycles / sample_count) if sample_count else 0.0
+        recovered_rate = (
+            recovered_cycles / degraded_or_failed_cycles if degraded_or_failed_cycles else 0.0
+        )
+        average_risk_delta = (total_risk_delta / sample_count) if sample_count else 0.0
+        average_final_risk = (
+            sum(final_risk_values) / len(final_risk_values) if final_risk_values else 0.0
+        )
+        blocked_ratio = (blocked_policy_steps / total_steps) if total_steps else 0.0
+        unhealthy_after_ratio = (unhealthy_after_count / sample_count) if sample_count else 0.0
+
+        risk_slope = self._trend_slope(final_risk_values)
+        error_slope = self._trend_slope(error_rate_values)
+        latency_slope = self._trend_slope(latency_values)
+
+        stability_score = 55.0
+        stability_score += improved_rate * 25.0
+        stability_score += recovered_rate * 12.0
+        stability_score += max(-10.0, min(10.0, average_risk_delta * 2.0))
+        stability_score += max(-12.0, min(12.0, -risk_slope * 2.5))
+        stability_score += max(-8.0, min(8.0, -error_slope * 2.0))
+        stability_score += max(-7.0, min(7.0, -latency_slope * 0.05))
+        stability_score -= blocked_ratio * 18.0
+        stability_score -= unhealthy_after_ratio * 18.0
+        stability_score = max(0.0, min(100.0, stability_score))
+
+        recommendations: List[str] = []
+        if blocked_ratio >= 0.25:
+            recommendations.append("Policy blocks are frequent; tune cooldown/rate-limit thresholds to reduce remediation stalls.")
+        if error_slope > 0.15:
+            recommendations.append("Error rate trend is rising; prioritize restart/rollback earlier in degraded states.")
+        if latency_slope > 10.0:
+            recommendations.append("Latency trend is rising fast; increase scale/clear-cache priority during traffic spikes.")
+        if improved_rate < 0.45:
+            recommendations.append("Improvement rate is low; run autotune to optimize scoring and policy parameters.")
+        if recovered_rate < 0.35 and degraded_or_failed_cycles >= 5:
+            recommendations.append("Recovery-to-healthy rate is weak; make rollback trigger more aggressive.")
+        if not recommendations:
+            if stability_score >= 80.0:
+                recommendations.append("System is stable; keep current policy and run periodic benchmark checks.")
+            elif stability_score >= 60.0:
+                recommendations.append("System is mostly stable; run benchmark/autotune to improve recovery quality.")
+            else:
+                recommendations.append("Stability is low; run autotune and review policy thresholds immediately.")
+
+        start_ts = str(reports[0].get("timestamp", ""))
+        end_ts = str(reports[-1].get("timestamp", ""))
+        top_actions = sorted(action_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+        dominant_severity = (
+            max(severity_counts.items(), key=lambda item: item[1])[0] if severity_counts else "unknown"
+        )
+
+        return {
+            "service": service,
+            "window_size": safe_window,
+            "sample_count": sample_count,
+            "time_range": {"start": start_ts, "end": end_ts},
+            "improved_cycles": improved_cycles,
+            "improved_rate_percent": round(improved_rate * 100.0, 2),
+            "recovered_to_healthy_cycles": recovered_cycles,
+            "recovered_rate_percent": round(recovered_rate * 100.0, 2),
+            "average_risk_delta": round(average_risk_delta, 3),
+            "average_final_risk": round(average_final_risk, 3),
+            "severity_counts": severity_counts,
+            "dominant_severity": dominant_severity,
+            "action_counts": action_counts,
+            "top_actions": top_actions,
+            "policy_blocked_steps": blocked_policy_steps,
+            "policy_blocked_ratio": round(blocked_ratio, 3),
+            "unhealthy_after_ratio": round(unhealthy_after_ratio, 3),
+            "trend": {
+                "risk_slope": round(risk_slope, 4),
+                "error_rate_slope": round(error_slope, 4),
+                "latency_ms_slope": round(latency_slope, 4),
+            },
+            "stability_score": round(stability_score, 2),
+            "recommendation": recommendations[0],
+        }
+
 
 class SelfHealingDevOpsAgent:
     def __init__(
@@ -824,7 +1040,7 @@ class DevOpsChatbot:
 
     def run(self) -> None:
         print("AI DevOps Agent Chatbot (Python only)")
-        print("Type: status, diagnose, heal, simulate, auto 5, memory, report, help, quit")
+        print("Type: status, diagnose, heal, simulate, auto 5, memory, report, analytics, help, quit")
 
         while True:
             try:
@@ -840,7 +1056,10 @@ class DevOpsChatbot:
                 print("bot> Session closed.")
                 return
             if lowered == "help":
-                print("bot> Commands: status | diagnose | heal | simulate | auto <cycles> [max_actions] | memory | report | quit")
+                print(
+                    "bot> Commands: status | diagnose | heal | simulate | auto <cycles> [max_actions] "
+                    "| memory | report | analytics [window] | quit"
+                )
                 continue
             if lowered == "status":
                 print(f"bot> {format_state(self.platform.get_state(self.service))}")
@@ -895,6 +1114,14 @@ class DevOpsChatbot:
                 else:
                     print(f"bot> {format_detailed_report(latest)}")
                 continue
+            if lowered.startswith("analytics"):
+                parts = lowered.split()
+                window = 40
+                if len(parts) > 1 and parts[1].isdigit():
+                    window = min(300, max(5, int(parts[1])))
+                analytics = self.agent.memory.analytics(self.service, window=window)
+                print(f"bot> {format_analytics_report(analytics)}")
+                continue
 
             if any(word in lowered for word in ["deploy", "broken", "fix", "incident", "down"]):
                 report = self.agent.run_healing_cycle(
@@ -905,7 +1132,7 @@ class DevOpsChatbot:
                 print(f"bot> Triggered incident triage. {summarize_report(report)}")
                 continue
 
-            print("bot> I did not understand. Try: status, diagnose, heal, simulate, auto 5, memory, help, quit")
+            print("bot> I did not understand. Try: status, diagnose, heal, simulate, auto 5, memory, analytics, help, quit")
 
 
 def format_state(state: DeploymentState) -> str:
@@ -963,6 +1190,35 @@ def format_detailed_report(report: Dict[str, Any]) -> str:
         f"before={format_state(before_state)}\n"
         f"after={format_state(after_state)}\n"
         f"steps={' | '.join(step_summaries) if step_summaries else 'no-steps'}"
+    )
+
+
+def format_analytics_report(analytics: Dict[str, Any]) -> str:
+    sample_count = int(analytics.get("sample_count", 0))
+    if sample_count <= 0:
+        return (
+            f"service={analytics.get('service', 'unknown')} | samples=0 | "
+            "No analytics data yet. Run heal/auto cycles first."
+        )
+
+    trend = analytics.get("trend", {})
+    top_actions = analytics.get("top_actions", [])
+    top_actions_text = ", ".join(f"{name}:{count}" for name, count in top_actions) if top_actions else "none"
+
+    return (
+        f"service={analytics.get('service')} | samples={sample_count} | "
+        f"window={analytics.get('window_size')} | stability={analytics.get('stability_score')}/100\n"
+        f"time={analytics.get('time_range', {}).get('start')} -> {analytics.get('time_range', {}).get('end')}\n"
+        f"improved={analytics.get('improved_rate_percent')}% | "
+        f"recovered={analytics.get('recovered_rate_percent')}% | "
+        f"avg_risk_delta={analytics.get('average_risk_delta')} | "
+        f"avg_final_risk={analytics.get('average_final_risk')}\n"
+        f"dominant_severity={analytics.get('dominant_severity')} | top_actions={top_actions_text}\n"
+        f"policy_blocked_ratio={analytics.get('policy_blocked_ratio')} | "
+        f"unhealthy_after_ratio={analytics.get('unhealthy_after_ratio')}\n"
+        f"trend_risk={trend.get('risk_slope')} | trend_error={trend.get('error_rate_slope')} | "
+        f"trend_latency={trend.get('latency_ms_slope')}\n"
+        f"recommendation={analytics.get('recommendation')}"
     )
 
 
@@ -1264,6 +1520,9 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("memory", help="Show memory statistics from past actions.")
     report_parser = subparsers.add_parser("report", help="Show the latest healing report.")
     report_parser.add_argument("--json", action="store_true", help="Print full report as JSON.")
+    analytics_parser = subparsers.add_parser("analytics", help="Show advanced analytics from historical reports.")
+    analytics_parser.add_argument("--window", type=int, default=40, help="How many recent reports to analyze.")
+    analytics_parser.add_argument("--json", action="store_true", help="Print analytics result as JSON.")
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Run simulation benchmark and print reliability metrics.")
     benchmark_parser.add_argument("--episodes", type=int, default=20, help="Number of benchmark episodes.")
@@ -1381,6 +1640,17 @@ def main() -> None:
 
     if command == "memory":
         print(agent.memory.summary())
+        return
+
+    if command == "analytics":
+        analytics = agent.memory.analytics(
+            service=args.service,
+            window=max(1, min(600, int(args.window))),
+        )
+        if args.json:
+            print(json.dumps(analytics, indent=2))
+        else:
+            print(format_analytics_report(analytics))
         return
 
     if command == "report":
