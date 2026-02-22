@@ -1073,6 +1073,13 @@ def run_benchmark(
     recovered_rate = (recovered_cycles / total_cycles * 100.0) if total_cycles else 0.0
     avg_risk_delta = (total_risk_delta / total_cycles) if total_cycles else 0.0
     avg_steps = (total_steps / total_cycles) if total_cycles else 0.0
+    quality_score = (
+        improved_rate * 0.60
+        + recovered_rate * 0.35
+        + avg_risk_delta * 8.0
+        - blocked_policy_steps * 0.45
+        - max(0.0, avg_steps - 1.0) * 2.2
+    )
 
     return {
         "episodes": episodes,
@@ -1087,8 +1094,139 @@ def run_benchmark(
         "average_risk_delta": round(avg_risk_delta, 3),
         "average_steps_per_cycle": round(avg_steps, 3),
         "blocked_policy_steps": blocked_policy_steps,
+        "quality_score": round(quality_score, 3),
         "severity_counts": severity_counts,
         "action_counts": action_counts,
+    }
+
+
+def _clamp_float(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def _mutated_config(base: AgentConfig, rng: random.Random) -> AgentConfig:
+    payload = base.to_dict()
+
+    for action in payload["base_priority"]:
+        jitter = rng.uniform(0.82, 1.20)
+        payload["base_priority"][action] = round(float(payload["base_priority"][action]) * jitter, 3)
+
+    for action in payload["cooldown_seconds"]:
+        base_value = int(payload["cooldown_seconds"][action])
+        new_value = _clamp_int(int(round(base_value * rng.uniform(0.7, 1.4))), 0, 300)
+        payload["cooldown_seconds"][action] = new_value
+
+    for action in payload["rate_limit_per_5m"]:
+        base_value = int(payload["rate_limit_per_5m"][action])
+        if action == "observe_only":
+            payload["rate_limit_per_5m"][action] = max(100, base_value)
+            continue
+        new_value = _clamp_int(int(round(base_value * rng.uniform(0.75, 1.35))), 1, 30)
+        payload["rate_limit_per_5m"][action] = new_value
+
+    for action in payload["action_penalty"]:
+        base_value = float(payload["action_penalty"][action])
+        new_value = _clamp_float(base_value * rng.uniform(0.65, 1.35), 0.0, 30.0)
+        payload["action_penalty"][action] = round(new_value, 3)
+
+    medium = _clamp_float(float(payload["severity_thresholds"]["medium"]) + rng.uniform(-8.0, 8.0), 25.0, 70.0)
+    high = _clamp_float(float(payload["severity_thresholds"]["high"]) + rng.uniform(-10.0, 10.0), medium + 12.0, 120.0)
+    critical = _clamp_float(
+        float(payload["severity_thresholds"]["critical"]) + rng.uniform(-14.0, 14.0),
+        high + 12.0,
+        180.0,
+    )
+    payload["severity_thresholds"]["medium"] = round(medium, 3)
+    payload["severity_thresholds"]["high"] = round(high, 3)
+    payload["severity_thresholds"]["critical"] = round(critical, 3)
+
+    exploration = _clamp_float(float(payload["exploration_strength"]) * rng.uniform(0.35, 1.9), 0.0, 12.0)
+    payload["exploration_strength"] = round(exploration, 3)
+
+    return AgentConfig.from_dict(payload)
+
+
+def run_autotune(
+    service: str,
+    episodes: int,
+    cycles_per_episode: int,
+    max_actions: int,
+    simulate: bool,
+    seed: int,
+    base_config: AgentConfig,
+    trials: int,
+) -> Dict[str, Any]:
+    trials = _clamp_int(trials, 2, 80)
+    rng = random.Random(seed)
+
+    candidates: List[AgentConfig] = [base_config]
+    for _ in range(trials - 1):
+        candidates.append(_mutated_config(base_config, rng))
+
+    leaderboard: List[Dict[str, Any]] = []
+    best_entry: Optional[Dict[str, Any]] = None
+
+    for index, candidate in enumerate(candidates, start=1):
+        benchmark_seed = seed + index * 100_003
+        result = run_benchmark(
+            service=service,
+            episodes=episodes,
+            cycles_per_episode=cycles_per_episode,
+            max_actions=max_actions,
+            simulate=simulate,
+            seed=benchmark_seed,
+            config=candidate,
+        )
+        entry = {
+            "trial": index,
+            "seed": benchmark_seed,
+            "quality_score": result["quality_score"],
+            "improved_rate_percent": result["improved_rate_percent"],
+            "recovered_rate_percent": result["recovered_rate_percent"],
+            "average_risk_delta": result["average_risk_delta"],
+            "blocked_policy_steps": result["blocked_policy_steps"],
+            "average_steps_per_cycle": result["average_steps_per_cycle"],
+            "config": candidate.to_dict(),
+            "benchmark": result,
+        }
+        leaderboard.append(entry)
+        if best_entry is None or float(entry["quality_score"]) > float(best_entry["quality_score"]):
+            best_entry = entry
+
+    leaderboard.sort(key=lambda item: float(item["quality_score"]), reverse=True)
+    assert best_entry is not None
+
+    top_n = min(5, len(leaderboard))
+    top_trials = [
+        {
+            "trial": trial["trial"],
+            "quality_score": trial["quality_score"],
+            "improved_rate_percent": trial["improved_rate_percent"],
+            "recovered_rate_percent": trial["recovered_rate_percent"],
+            "average_risk_delta": trial["average_risk_delta"],
+            "blocked_policy_steps": trial["blocked_policy_steps"],
+        }
+        for trial in leaderboard[:top_n]
+    ]
+
+    return {
+        "service": service,
+        "trials": trials,
+        "episodes": episodes,
+        "cycles_per_episode": cycles_per_episode,
+        "max_actions": max_actions,
+        "simulate": simulate,
+        "seed": seed,
+        "best_trial": best_entry["trial"],
+        "best_quality_score": best_entry["quality_score"],
+        "best_config": best_entry["config"],
+        "best_benchmark": best_entry["benchmark"],
+        "top_trials": top_trials,
+        "leaderboard": leaderboard,
     }
 
 
@@ -1145,6 +1283,35 @@ def parse_args() -> argparse.Namespace:
         dest="simulate",
         action="store_false",
         help="Run benchmark without injecting incidents.",
+    )
+
+    autotune_parser = subparsers.add_parser(
+        "autotune",
+        help="Search policy/scoring configuration space and select the best config via benchmark quality score.",
+    )
+    autotune_parser.add_argument("--trials", type=int, default=12, help="Number of candidate configs to evaluate.")
+    autotune_parser.add_argument("--episodes", type=int, default=16, help="Episodes per trial.")
+    autotune_parser.add_argument("--cycles", type=int, default=8, help="Cycles per episode.")
+    autotune_parser.add_argument("--max-actions", type=int, default=2, help="Max remediation actions per cycle.")
+    autotune_parser.add_argument("--json", action="store_true", help="Print full autotune result as JSON.")
+    autotune_parser.add_argument(
+        "--write-config",
+        default="",
+        help="Optional file path to write the best config JSON.",
+    )
+    autotune_sim_group = autotune_parser.add_mutually_exclusive_group()
+    autotune_sim_group.add_argument(
+        "--simulate",
+        dest="simulate",
+        action="store_true",
+        default=True,
+        help="Inject random incidents during autotune benchmark (default).",
+    )
+    autotune_sim_group.add_argument(
+        "--no-simulate",
+        dest="simulate",
+        action="store_false",
+        help="Run autotune without injecting incidents.",
     )
 
     subparsers.add_parser("config", help="Print the active merged agent config.")
@@ -1248,10 +1415,44 @@ def main() -> None:
                 f"recovered_rate={benchmark['recovered_rate_percent']}%\n"
                 f"avg_risk_delta={benchmark['average_risk_delta']}, "
                 f"avg_steps={benchmark['average_steps_per_cycle']}, "
-                f"blocked_policy_steps={benchmark['blocked_policy_steps']}\n"
+                f"blocked_policy_steps={benchmark['blocked_policy_steps']}, "
+                f"quality_score={benchmark['quality_score']}\n"
                 f"severity_counts={benchmark['severity_counts']}\n"
                 f"action_counts={benchmark['action_counts']}"
             )
+        return
+
+    if command == "autotune":
+        autotune = run_autotune(
+            service=args.service,
+            trials=max(2, int(args.trials)),
+            episodes=max(1, int(args.episodes)),
+            cycles_per_episode=max(1, int(args.cycles)),
+            max_actions=max(1, min(5, int(args.max_actions))),
+            simulate=bool(args.simulate),
+            seed=int(args.seed),
+            base_config=config,
+        )
+
+        if args.write_config:
+            output_path = Path(args.write_config)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(autotune["best_config"], indent=2), encoding="utf-8")
+
+        if args.json:
+            print(json.dumps(autotune, indent=2))
+        else:
+            print(
+                "Autotune Summary\n"
+                f"trials={autotune['trials']}, best_trial={autotune['best_trial']}, "
+                f"best_quality_score={autotune['best_quality_score']}\n"
+                f"best_improved_rate={autotune['best_benchmark']['improved_rate_percent']}%, "
+                f"best_recovered_rate={autotune['best_benchmark']['recovered_rate_percent']}%, "
+                f"best_avg_risk_delta={autotune['best_benchmark']['average_risk_delta']}\n"
+                f"top_trials={autotune['top_trials']}"
+            )
+            if args.write_config:
+                print(f"Best config written to {args.write_config}")
         return
 
     chatbot = DevOpsChatbot(agent, platform, args.service)

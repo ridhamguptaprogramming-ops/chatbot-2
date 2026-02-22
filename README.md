@@ -18,6 +18,7 @@ Python-only autonomous DevOps agent with a chatbot interface and self-healing de
 - Diagnose mode (`dry-run`) without taking action
 - Configurable policy/scoring via external JSON (`--config-file`)
 - Built-in benchmark mode for reliability/performance metrics
+- Auto-tuning mode that searches configuration space and selects the best policy/scoring profile
 
 ## Core Flow
 
@@ -92,6 +93,13 @@ python3 ai_devops_agent.py benchmark --episodes 20 --cycles 8 --max-actions 2
 python3 ai_devops_agent.py benchmark --json
 ```
 
+Autotune:
+```bash
+python3 ai_devops_agent.py autotune --trials 12 --episodes 16 --cycles 8 --max-actions 2
+python3 ai_devops_agent.py autotune --json
+python3 ai_devops_agent.py autotune --write-config ./best_agent_config.json
+```
+
 Config:
 ```bash
 python3 ai_devops_agent.py config
@@ -131,3 +139,4 @@ Example `agent_config.json`:
 - Policy guardrails can intentionally block repeated actions to avoid remediation thrashing.
 - The mock platform can be replaced with real integrations (Kubernetes, CI/CD, observability) while keeping the agent logic.
 - Global flags (like `--config-file`) must be passed before subcommands.
+- Benchmark and autotune both include a `quality_score` to compare policy/scoring quality numerically.
