@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,127 @@ class ActionResult:
     action: str
     ok: bool
     details: str
+
+
+@dataclass
+class RankedAction:
+    action: Action
+    score: float
+    blocked: bool
+    block_reason: str
+
+
+@dataclass
+class AgentConfig:
+    base_priority: Dict[str, float]
+    cooldown_seconds: Dict[str, int]
+    rate_limit_per_5m: Dict[str, int]
+    severity_thresholds: Dict[str, float]
+    action_penalty: Dict[str, float]
+    exploration_strength: float
+
+    @classmethod
+    def default(cls) -> "AgentConfig":
+        return cls(
+            base_priority={
+                "rollback": 95.0,
+                "restart_service": 80.0,
+                "scale": 70.0,
+                "clear_cache": 55.0,
+                "observe_only": 10.0,
+            },
+            cooldown_seconds={
+                "rollback": 180,
+                "restart_service": 45,
+                "scale": 20,
+                "clear_cache": 20,
+                "observe_only": 0,
+            },
+            rate_limit_per_5m={
+                "rollback": 1,
+                "restart_service": 5,
+                "scale": 8,
+                "clear_cache": 8,
+                "observe_only": 999,
+            },
+            severity_thresholds={
+                "critical": 130.0,
+                "high": 85.0,
+                "medium": 45.0,
+            },
+            action_penalty={
+                "rollback": 10.0,
+                "restart_service": 2.0,
+                "scale": 1.0,
+                "clear_cache": 0.8,
+                "observe_only": 0.0,
+            },
+            exploration_strength=3.2,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "base_priority": dict(self.base_priority),
+            "cooldown_seconds": dict(self.cooldown_seconds),
+            "rate_limit_per_5m": dict(self.rate_limit_per_5m),
+            "severity_thresholds": dict(self.severity_thresholds),
+            "action_penalty": dict(self.action_penalty),
+            "exploration_strength": float(self.exploration_strength),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "AgentConfig":
+        base = cls.default()
+
+        def _merge_float_map(default_map: Dict[str, float], raw_value: Any) -> Dict[str, float]:
+            merged = dict(default_map)
+            if isinstance(raw_value, dict):
+                for key, value in raw_value.items():
+                    try:
+                        merged[str(key)] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+            return merged
+
+        def _merge_int_map(default_map: Dict[str, int], raw_value: Any) -> Dict[str, int]:
+            merged = dict(default_map)
+            if isinstance(raw_value, dict):
+                for key, value in raw_value.items():
+                    try:
+                        merged[str(key)] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+            return merged
+
+        exploration = base.exploration_strength
+        try:
+            if "exploration_strength" in payload:
+                exploration = max(0.0, float(payload["exploration_strength"]))
+        except (TypeError, ValueError):
+            exploration = base.exploration_strength
+
+        return cls(
+            base_priority=_merge_float_map(base.base_priority, payload.get("base_priority")),
+            cooldown_seconds=_merge_int_map(base.cooldown_seconds, payload.get("cooldown_seconds")),
+            rate_limit_per_5m=_merge_int_map(base.rate_limit_per_5m, payload.get("rate_limit_per_5m")),
+            severity_thresholds=_merge_float_map(base.severity_thresholds, payload.get("severity_thresholds")),
+            action_penalty=_merge_float_map(base.action_penalty, payload.get("action_penalty")),
+            exploration_strength=exploration,
+        )
+
+
+def load_agent_config(config_file: Optional[Path]) -> AgentConfig:
+    if config_file is None:
+        return AgentConfig.default()
+    try:
+        payload = json.loads(config_file.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Config file not found: {config_file}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in config file: {config_file}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Config file root must be a JSON object.")
+    return AgentConfig.from_dict(payload)
 
 
 class JsonFileStore:
@@ -261,18 +383,96 @@ class AgentMemory:
         stats = self.data.setdefault("action_stats", {})
         return stats.setdefault(action_name, {"ok": 0, "failed": 0}) # type: ignore
 
-    def record(self, action_name: str, ok: bool, report: Dict[str, object]) -> None:
+    def action_total(self, action_name: str) -> int:
+        stats = self.stats_for(action_name)
+        return int(stats.get("ok", 0)) + int(stats.get("failed", 0))
+
+    def global_action_total(self) -> int:
+        stats = self.data.get("action_stats", {})
+        total = 0
+        if isinstance(stats, dict):
+            for values in stats.values():
+                if isinstance(values, dict):
+                    total += int(values.get("ok", 0)) + int(values.get("failed", 0))
+        return total
+
+    def _history(self) -> List[Dict[str, Any]]:
+        return self.data.setdefault("action_history", []) # type: ignore
+
+    @staticmethod
+    def _parse_timestamp(raw_value: Any) -> Optional[datetime]:
+        try:
+            parsed = datetime.fromisoformat(str(raw_value))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def record_action(self, service: str, action_name: str, ok: bool) -> None:
         stats = self.stats_for(action_name)
         if ok:
             stats["ok"] += 1
         else:
             stats["failed"] += 1
 
-        reports: List[Dict[str, object]] = self.data.setdefault("recent_reports", []) # type: ignore
-        reports.append(report)
-        if len(reports) > 30:
-            del reports[0 : len(reports) - 30]
+        history = self._history()
+        history.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "service": service,
+                "action": action_name,
+                "ok": ok,
+            }
+        )
+        if len(history) > 800:
+            del history[0 : len(history) - 800]
         self._save()
+
+    def append_report(self, report: Dict[str, Any]) -> None:
+        reports: List[Dict[str, Any]] = self.data.setdefault("recent_reports", []) # type: ignore
+        reports.append(report)
+        if len(reports) > 60:
+            del reports[0 : len(reports) - 60]
+        self._save()
+
+    def record(self, action_name: str, ok: bool, report: Dict[str, object]) -> None:
+        service = str(report.get("service", "unknown"))
+        self.record_action(service=service, action_name=action_name, ok=ok)
+        self.append_report(dict(report))
+
+    def recent_action_count(self, service: str, action_name: str, within_seconds: int) -> int:
+        history = self._history()
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=within_seconds)
+        total = 0
+        for item in reversed(history):
+            if item.get("service") != service:
+                continue
+            if item.get("action") != action_name:
+                continue
+            timestamp = self._parse_timestamp(item.get("timestamp"))
+            if timestamp is None:
+                continue
+            if timestamp < cutoff:
+                break
+            total += 1
+        return total
+
+    def seconds_since_last_action(self, service: str, action_name: str) -> Optional[float]:
+        history = self._history()
+        now = datetime.now(timezone.utc)
+        for item in reversed(history):
+            if item.get("service") != service:
+                continue
+            if item.get("action") != action_name:
+                continue
+            timestamp = self._parse_timestamp(item.get("timestamp"))
+            if timestamp is None:
+                continue
+            delta = now - timestamp
+            return max(0.0, delta.total_seconds())
+        return None
 
     def summary(self) -> str:
         stats = self.data.get("action_stats", {})
@@ -302,6 +502,20 @@ class SelfHealingDevOpsAgent:
         "clear_cache": 55.0,
         "observe_only": 10.0,
     }
+    ACTION_COOLDOWN_SECONDS = {
+        "rollback": 180,
+        "restart_service": 45,
+        "scale": 20,
+        "clear_cache": 20,
+        "observe_only": 0,
+    }
+    ACTION_RATE_LIMIT_PER_5M = {
+        "rollback": 1,
+        "restart_service": 5,
+        "scale": 8,
+        "clear_cache": 8,
+        "observe_only": 999,
+    }
 
     def __init__(self, platform: MockDeploymentPlatform, memory: AgentMemory):
         self.platform = platform
@@ -326,6 +540,16 @@ class SelfHealingDevOpsAgent:
         if not findings:
             findings.append("No critical issues detected.")
         return findings
+
+    def classify_severity(self, state: DeploymentState) -> str:
+        risk = self._risk_score(state)
+        if state.status == "failed" or risk >= 130:
+            return "critical"
+        if risk >= 85:
+            return "high"
+        if risk >= 45:
+            return "medium"
+        return "low"
 
     def plan_actions(self, state: DeploymentState, findings: List[str]) -> List[Action]:
         del findings
@@ -361,6 +585,9 @@ class SelfHealingDevOpsAgent:
         if state.error_rate > 3.0 and state.latency_ms > 650:
             actions.append(Action("clear_cache", "Cache corruption likely affecting latency and errors.", {}))
 
+        if state.status == "degraded" and state.error_rate >= 2.5 and state.latency_ms >= 300:
+            actions.append(Action("clear_cache", "Moderate degradation with elevated latency/error trend.", {}))
+
         if state.status == "degraded" and state.latency_ms > 450:
             actions.append(Action("clear_cache", "Latency regression in degraded mode.", {}))
 
@@ -376,15 +603,51 @@ class SelfHealingDevOpsAgent:
             deduped[key] = action
         return list(deduped.values())
 
-    def choose_action(self, candidates: List[Action]) -> Action:
-        best = candidates[0]
-        best_score = self._action_score(best)
-        for action in candidates[1:]:
+    def _policy_block_reason(self, service: str, action_name: str) -> str:
+        if action_name == "observe_only":
+            return ""
+
+        cooldown = self.ACTION_COOLDOWN_SECONDS.get(action_name, 0)
+        if cooldown > 0:
+            since_last = self.memory.seconds_since_last_action(service, action_name)
+            if since_last is not None and since_last < cooldown:
+                wait_for = int(cooldown - since_last)
+                return f"cooldown_active_wait_{wait_for}s"
+
+        max_in_window = self.ACTION_RATE_LIMIT_PER_5M.get(action_name, 999)
+        recent_count = self.memory.recent_action_count(service, action_name, within_seconds=300)
+        if recent_count >= max_in_window:
+            return f"rate_limited_5m_{recent_count}/{max_in_window}"
+
+        return ""
+
+    def rank_actions(self, service: str, state: DeploymentState, candidates: List[Action]) -> List[RankedAction]:
+        severity = self.classify_severity(state)
+        severity_bonus = {"low": 0.0, "medium": 4.0, "high": 8.0, "critical": 12.0}[severity]
+        ranked: List[RankedAction] = []
+
+        for action in candidates:
             score = self._action_score(action)
-            if score > best_score:
-                best = action
-                best_score = score
-        return best
+            if action.name != "observe_only":
+                score += severity_bonus
+            block_reason = self._policy_block_reason(service=service, action_name=action.name)
+            ranked.append(
+                RankedAction(
+                    action=action,
+                    score=score,
+                    blocked=bool(block_reason),
+                    block_reason=block_reason,
+                )
+            )
+
+        ranked.sort(key=lambda item: item.score, reverse=True)
+        return ranked
+
+    def choose_action(self, ranked_actions: List[RankedAction]) -> Action:
+        for ranked in ranked_actions:
+            if not ranked.blocked:
+                return ranked.action
+        return Action("observe_only", "All remediation actions blocked by safety policy.", {})
 
     def _action_score(self, action: Action) -> float:
         base = self.BASE_PRIORITY.get(action.name, 25.0)
@@ -408,28 +671,114 @@ class SelfHealingDevOpsAgent:
             return self.platform.clear_cache(service)
         return ActionResult(action="observe_only", ok=True, details="No action executed.")
 
-    def run_healing_cycle(self, service: str, inject_event: bool = False) -> Dict[str, object]:
+    def run_healing_cycle(
+        self,
+        service: str,
+        inject_event: bool = False,
+        max_actions: int = 1,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        max_actions = max(1, min(5, int(max_actions)))
+        event = ""
         if inject_event:
-            self.platform.inject_random_event(service)
-        before = self.platform.get_state(service)
-        findings = self.diagnose(before)
-        plan = self.plan_actions(before, findings)
-        chosen = self.choose_action(plan)
-        result = self.execute(service, chosen)
-        after = self.platform.get_state(service)
-        improved = self._is_improved(before, after)
+            event = self.platform.inject_random_event(service)
 
-        report = {
+        before = self.platform.get_state(service)
+        initial_risk = self._risk_score(before)
+        severity = self.classify_severity(before)
+        current_state = before
+
+        steps: List[Dict[str, Any]] = []
+        for step_number in range(1, max_actions + 1):
+            findings = self.diagnose(current_state)
+            candidates = self.plan_actions(current_state, findings)
+            ranked = self.rank_actions(service=service, state=current_state, candidates=candidates)
+            chosen = self.choose_action(ranked)
+
+            if dry_run:
+                action_result = ActionResult(
+                    action="observe_only",
+                    ok=True,
+                    details="Dry-run mode, no action executed.",
+                )
+                next_state = current_state
+                step_improved = False
+            else:
+                action_result = self.execute(service, chosen)
+                next_state = self.platform.get_state(service)
+                step_improved = self._is_improved(current_state, next_state)
+                if chosen.name != "observe_only":
+                    self.memory.record_action(
+                        service=service,
+                        action_name=chosen.name,
+                        ok=action_result.ok and step_improved,
+                    )
+
+            steps.append(
+                {
+                    "step": step_number,
+                    "state_before": asdict(current_state),
+                    "findings": findings,
+                    "ranked_candidates": [
+                        {
+                            "name": ranked_action.action.name,
+                            "reason": ranked_action.action.reason,
+                            "params": ranked_action.action.params,
+                            "score": round(ranked_action.score, 3),
+                            "blocked": ranked_action.blocked,
+                            "block_reason": ranked_action.block_reason,
+                        }
+                        for ranked_action in ranked
+                    ],
+                    "chosen_action": asdict(chosen),
+                    "action_result": asdict(action_result),
+                    "state_after": asdict(next_state),
+                    "step_improved": step_improved,
+                }
+            )
+
+            current_state = next_state
+            if dry_run or chosen.name == "observe_only":
+                break
+            if current_state.status == "healthy" and step_improved:
+                break
+
+        after = current_state
+        final_risk = self._risk_score(after)
+        improved = self._is_improved(before, after)
+        first_findings = steps[0]["findings"] if steps else []
+        last_step = steps[-1] if steps else {}
+        primary_step = {}
+        for step in steps:
+            chosen_name = step.get("chosen_action", {}).get("name")
+            if chosen_name and chosen_name != "observe_only":
+                primary_step = step
+                break
+        if not primary_step:
+            primary_step = last_step
+
+        report: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "service": service,
+            "event": event,
+            "severity": severity,
             "before": asdict(before),
-            "findings": findings,
-            "chosen_action": asdict(chosen),
-            "action_result": asdict(result),
+            "initial_risk_score": round(initial_risk, 3),
+            "final_risk_score": round(final_risk, 3),
+            "risk_delta": round(initial_risk - final_risk, 3),
+            "dry_run": dry_run,
+            "steps": steps,
+            "findings": first_findings,
+            "chosen_action": primary_step.get("chosen_action", asdict(Action("observe_only", "No action selected.", {}))),
+            "action_result": primary_step.get(
+                "action_result",
+                asdict(ActionResult(action="observe_only", ok=True, details="No action executed.")),
+            ),
+            "terminal_action": last_step.get("chosen_action", asdict(Action("observe_only", "No action selected.", {}))),
             "after": asdict(after),
             "improved": improved,
         }
-        self.memory.record(chosen.name, result.ok and improved, report)
+        self.memory.append_report(report)
         return report
 
     def _risk_score(self, state: DeploymentState) -> float:
@@ -479,7 +828,7 @@ class DevOpsChatbot:
 
     def run(self) -> None:
         print("AI DevOps Agent Chatbot (Python only)")
-        print("Type: status, heal, simulate, auto 5, memory, report, help, quit")
+        print("Type: status, diagnose, heal, simulate, auto 5, memory, report, help, quit")
 
         while True:
             try:
@@ -495,10 +844,19 @@ class DevOpsChatbot:
                 print("bot> Session closed.")
                 return
             if lowered == "help":
-                print("bot> Commands: status | heal | simulate | auto <cycles> | memory | report | quit")
+                print("bot> Commands: status | diagnose | heal | simulate | auto <cycles> [max_actions] | memory | report | quit")
                 continue
             if lowered == "status":
                 print(f"bot> {format_state(self.platform.get_state(self.service))}")
+                continue
+            if lowered == "diagnose":
+                report = self.agent.run_healing_cycle(
+                    self.service,
+                    inject_event=False,
+                    max_actions=2,
+                    dry_run=True,
+                )
+                print(f"bot> {format_detailed_report(report)}")
                 continue
             if lowered == "simulate":
                 event = self.platform.inject_random_event(self.service)
@@ -508,16 +866,27 @@ class DevOpsChatbot:
             if lowered.startswith("auto"):
                 parts = lowered.split()
                 cycles = 3
+                max_actions = 2
                 if len(parts) > 1 and parts[1].isdigit():
                     cycles = min(20, max(1, int(parts[1])))
+                if len(parts) > 2 and parts[2].isdigit():
+                    max_actions = min(5, max(1, int(parts[2])))
                 print(f"bot> Running {cycles} autonomous cycles...")
                 for index in range(1, cycles + 1):
-                    report = self.agent.run_healing_cycle(self.service, inject_event=True)
+                    report = self.agent.run_healing_cycle(
+                        self.service,
+                        inject_event=True,
+                        max_actions=max_actions,
+                    )
                     summary = summarize_report(report)
                     print(f"bot> Cycle {index}: {summary}")
                 continue
             if lowered == "heal":
-                report = self.agent.run_healing_cycle(self.service, inject_event=False)
+                report = self.agent.run_healing_cycle(
+                    self.service,
+                    inject_event=False,
+                    max_actions=2,
+                )
                 print(f"bot> {summarize_report(report)}")
                 continue
             if lowered == "memory":
@@ -532,11 +901,15 @@ class DevOpsChatbot:
                 continue
 
             if any(word in lowered for word in ["deploy", "broken", "fix", "incident", "down"]):
-                report = self.agent.run_healing_cycle(self.service, inject_event=True)
+                report = self.agent.run_healing_cycle(
+                    self.service,
+                    inject_event=True,
+                    max_actions=2,
+                )
                 print(f"bot> Triggered incident triage. {summarize_report(report)}")
                 continue
 
-            print("bot> I did not understand. Try: status, heal, simulate, auto 5, memory, help, quit")
+            print("bot> I did not understand. Try: status, diagnose, heal, simulate, auto 5, memory, help, quit")
 
 
 def format_state(state: DeploymentState) -> str:
@@ -548,13 +921,18 @@ def format_state(state: DeploymentState) -> str:
     )
 
 
-def summarize_report(report: Dict[str, object]) -> str:
-    action = report["chosen_action"]["name"] # type: ignore
-    reason = report["chosen_action"]["reason"] # type: ignore
-    improved = report["improved"]
-    after_state = DeploymentState(**report["after"]) # type: ignore
+def summarize_report(report: Dict[str, Any]) -> str:
+    chosen = report.get("chosen_action", {})
+    action = chosen.get("name", "observe_only")
+    reason = chosen.get("reason", "")
+    improved = report.get("improved")
+    severity = report.get("severity", "unknown")
+    risk_delta = float(report.get("risk_delta", 0.0))
+    steps = report.get("steps", [])
+    after_state = DeploymentState(**report["after"])
     return (
-        f"Action={action}; reason={reason}; improved={improved}; "
+        f"severity={severity}; steps={len(steps)}; action={action}; "
+        f"risk_delta={risk_delta:.2f}; improved={improved}; reason={reason}; "
         f"now {format_state(after_state)}"
     )
 
@@ -566,12 +944,29 @@ def format_detailed_report(report: Dict[str, Any]) -> str:
     reason = report["chosen_action"]["reason"]
     improved = report["improved"]
     findings = "; ".join(report.get("findings", []))
+    steps = report.get("steps", [])
+    step_summaries = []
+    for step in steps:
+        chosen_name = step.get("chosen_action", {}).get("name", "observe_only")
+        improved_flag = step.get("step_improved")
+        ranked = step.get("ranked_candidates", [])
+        ranked_preview = ", ".join(
+            f"{item.get('name')}[{item.get('score')}]"
+            + ("(blocked)" if item.get("blocked") else "")
+            for item in ranked[:3]
+        )
+        step_summaries.append(
+            f"step={step.get('step')} chosen={chosen_name} step_improved={improved_flag} ranked={ranked_preview}"
+        )
+
     return (
-        f"timestamp={report['timestamp']} | action={action} | improved={improved}\n"
+        f"timestamp={report['timestamp']} | severity={report.get('severity')} | action={action} | improved={improved}\n"
         f"reason={reason}\n"
         f"findings={findings}\n"
+        f"risk={report.get('initial_risk_score')} -> {report.get('final_risk_score')} (delta={report.get('risk_delta')})\n"
         f"before={format_state(before_state)}\n"
-        f"after={format_state(after_state)}"
+        f"after={format_state(after_state)}\n"
+        f"steps={' | '.join(step_summaries) if step_summaries else 'no-steps'}"
     )
 
 
@@ -586,6 +981,7 @@ def build_agent(state_path: Path, memory_path: Path) -> tuple[SelfHealingDevOpsA
         memory_path,
         default_data={
             "action_stats": {},
+            "action_history": [],
             "recent_reports": [],
         },
     )
@@ -600,9 +996,10 @@ def run_loop(
     cycles: int,
     interval_seconds: float,
     inject_event: bool,
+    max_actions: int,
 ) -> None:
     for index in range(1, cycles + 1):
-        report = agent.run_healing_cycle(service, inject_event=inject_event)
+        report = agent.run_healing_cycle(service, inject_event=inject_event, max_actions=max_actions)
         print(f"[{index}/{cycles}] {summarize_report(report)}")
         if index < cycles:
             time.sleep(interval_seconds)
@@ -625,11 +1022,18 @@ def parse_args() -> argparse.Namespace:
 
     heal_parser = subparsers.add_parser("heal", help="Run one self-healing cycle.")
     heal_parser.add_argument("--simulate", action="store_true", help="Inject a random event before healing.")
+    heal_parser.add_argument("--max-actions", type=int, default=2, help="Maximum remediation steps in one cycle.")
+    heal_parser.add_argument("--dry-run", action="store_true", help="Evaluate plan but do not execute actions.")
+
+    diagnose_parser = subparsers.add_parser("diagnose", help="Diagnose and plan without executing actions.")
+    diagnose_parser.add_argument("--simulate", action="store_true", help="Inject a random event before diagnosis.")
+    diagnose_parser.add_argument("--max-actions", type=int, default=2, help="Maximum planning depth.")
 
     loop_parser = subparsers.add_parser("loop", help="Run autonomous loop for multiple cycles.")
     loop_parser.add_argument("--cycles", type=int, default=10, help="Number of cycles.")
     loop_parser.add_argument("--interval", type=float, default=2.0, help="Seconds between cycles.")
     loop_parser.add_argument("--simulate", action="store_true", help="Inject random events each cycle.")
+    loop_parser.add_argument("--max-actions", type=int, default=2, help="Maximum remediation steps per cycle.")
 
     subparsers.add_parser("memory", help="Show memory statistics from past actions.")
     report_parser = subparsers.add_parser("report", help="Show the latest healing report.")
@@ -656,14 +1060,37 @@ def main() -> None:
         return
 
     if command == "heal":
-        report = agent.run_healing_cycle(args.service, inject_event=args.simulate)
+        report = agent.run_healing_cycle(
+            args.service,
+            inject_event=args.simulate,
+            max_actions=max(1, min(5, int(args.max_actions))),
+            dry_run=bool(args.dry_run),
+        )
         print(summarize_report(report))
+        return
+
+    if command == "diagnose":
+        report = agent.run_healing_cycle(
+            args.service,
+            inject_event=args.simulate,
+            max_actions=max(1, min(5, int(args.max_actions))),
+            dry_run=True,
+        )
+        print(format_detailed_report(report))
         return
 
     if command == "loop":
         cycles = max(1, min(200, int(args.cycles)))
         interval = max(0.0, float(args.interval))
-        run_loop(agent, args.service, cycles=cycles, interval_seconds=interval, inject_event=args.simulate)
+        max_actions = max(1, min(5, int(args.max_actions)))
+        run_loop(
+            agent,
+            args.service,
+            cycles=cycles,
+            interval_seconds=interval,
+            inject_event=args.simulate,
+            max_actions=max_actions,
+        )
         return
 
     if command == "memory":
