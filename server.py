@@ -136,7 +136,7 @@ class BackendService:
             return {"analytics": analytics}
 
     def _append_message(self, role: str, text: str, kind: str = "chat") -> Dict[str, Any]:
-        next_id = int(self.chat_data.get("next_id", 1))
+        next_id = int(self.chat_data.get("next_id", 1)) # type: ignore
         message = {
             "id": next_id,
             "role": role,
